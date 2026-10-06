@@ -1,32 +1,19 @@
-"""Thin tool registry over MCP / LangChain `BaseTool` instances.
-
-The agent loop in `ai_agent.agent.loop` drives a unified envelope schema
-where tool calls are JUST a block type — there is no LangGraph
-`ToolNode`, no `bind_tools`, no per-provider tool-call wire format. All
-the loop needs is "what tools exist, what do they do, and how do I call
-one of them by name and get a stringified result back."
-
-`ToolRegistry` is that surface. It wraps the `list[BaseTool]` returned
-by `MultiServerMCPClient.get_tools()` and exposes:
-
-- `schemas()` — a catalog rendering for the system prompt
-- `names()` — for quick existence checks
-- `ainvoke(name, args)` — the only entry point the loop calls; folds any
-  exception into a tool-result string so a tool error is data the LLM
-  reasons about, not an abort that kills the SSE stream
-
-Per-tool error handling lives here instead of being patched onto each
-`BaseTool` (the old `install_tool_error_handler` approach) so the
-registry is the single chokepoint for both error policy and the
-LangChain dependency.
-"""
+"""Name-to-tool registry over the MCP tools, and the one place a tool error becomes data."""
 
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 from typing import Any
 
+import structlog
 from langchain_core.tools import BaseTool
+from opentelemetry import trace
+from opentelemetry.trace import Span, Status, StatusCode
+
+logger = structlog.get_logger(__name__)
+_tracer = trace.get_tracer(__name__)
 
 
 def _is_permission_error(exc: Exception) -> bool:
@@ -49,12 +36,7 @@ def _is_permission_error(exc: Exception) -> bool:
 
 
 def _exception_to_result(exc: Exception) -> str:
-    """Convert any exception into a tool-result string the LLM can act on.
-
-    Free of stack traces / internal details. Permission errors are
-    distinguished from generic failures so the LLM can surface the
-    right user-facing message.
-    """
+    """Convert any exception into a tool-result string the LLM can act on."""
     if _is_permission_error(exc):
         return f"Access denied: permission error — {exc}"
     return f"Tool call failed: {exc}"
@@ -63,10 +45,16 @@ def _exception_to_result(exc: Exception) -> str:
 class ToolRegistry:
     """Wraps a list of LangChain BaseTool into a name → tool lookup."""
 
-    def __init__(self, tools: list[BaseTool]) -> None:
+    def __init__(self, tools: list[BaseTool], timeout_s: float = 30.0) -> None:
         # Dedup-by-name (last-write-wins) — paranoia for MCP servers that
         # surface two tools with the same name across namespaces.
         self._by_name: dict[str, BaseTool] = {t.name: t for t in tools}
+        self._timeout_s = timeout_s
+        # One row per call, in order: the turn's audit trail of what ran and how it ended.
+        self.invocations: list[dict[str, Any]] = []
+        for t in tools:
+            # langchain-mcp-adapters 0.3 returns an MCP isError result as ordinary output
+            t.handle_tool_error = False
 
     def names(self) -> set[str]:
         return set(self._by_name)
@@ -77,13 +65,15 @@ class ToolRegistry:
     def __contains__(self, name: str) -> bool:
         return name in self._by_name
 
-    def schemas(self) -> str:
-        """Render the tool catalog as a string for the system prompt.
+    def writes(self, name: str) -> bool:
+        """Whether the tool needs confirmation: anything but a declared read does."""
+        tool = self._by_name.get(name)
+        if tool is None:
+            return True
+        return (tool.metadata or {}).get("readOnlyHint") is not True
 
-        Format: one tool per block. `name` + first-paragraph description
-        + arg schema. Kept compact so the model can scan it; long
-        descriptions are truncated.
-        """
+    def schemas(self) -> str:
+        """Render the tool catalog as a string for the system prompt."""
         if not self._by_name:
             return "(no tools available this turn)"
         lines: list[str] = []
@@ -99,33 +89,86 @@ class ToolRegistry:
         return "\n".join(lines)
 
     async def ainvoke(self, name: str, args: dict[str, Any] | None) -> str:
-        """Run the named tool with `args`; always return a stringified result.
+        """Run the named tool; never raises: an unknown name or an error comes back as a string."""
+        started = time.perf_counter()
+        # Name and attributes as the OpenTelemetry GenAI conventions spell them.
+        with _tracer.start_as_current_span(f"execute_tool {name}") as span:
+            span.set_attribute("gen_ai.operation.name", "execute_tool")
+            span.set_attribute("gen_ai.tool.name", name)
+            error_type: str | None = None
+            if name not in self._by_name:
+                error_type = "UnknownTool"
+                result = f"error: unknown tool {name!r}; available: {sorted(self._by_name)}"
+            else:
+                try:
+                    raw = await asyncio.wait_for(
+                        self._by_name[name].ainvoke(args or {}), self._timeout_s
+                    )
+                except TimeoutError:
+                    logger.warning("tool_call_timed_out", tool=name, timeout_s=self._timeout_s)
+                    error_type = "TimeoutError"
+                    result = f"Tool call failed: {name} timed out after {self._timeout_s:.0f}s"
+                except Exception as exc:  # noqa: BLE001 - a tool failure is a result the model reads
+                    logger.warning(
+                        "tool_call_failed",
+                        tool=name,
+                        error_type=type(exc).__name__,
+                        error=str(exc)[:200],
+                    )
+                    error_type = type(exc).__name__
+                    result = _exception_to_result(exc)
+                else:
+                    result = _as_text(raw)
+            self._record(span, name, args, started, error_type)
+            return result
 
-        Any exception becomes a tool-result string. Unknown tool names
-        return an `error:` string so the model can correct itself.
-        """
-        if name not in self._by_name:
-            return f"error: unknown tool {name!r}; available: {sorted(self._by_name)}"
-        tool = self._by_name[name]
-        try:
-            raw = await tool.ainvoke(args or {})
-        except Exception as exc:
-            return _exception_to_result(exc)
-        # MCP tools return strings or pydantic models; coerce uniformly.
-        if isinstance(raw, str):
-            return raw
-        if hasattr(raw, "model_dump"):
-            return json.dumps(raw.model_dump(), ensure_ascii=False)
-        return str(raw)
+    def _record(
+        self,
+        span: Span,
+        name: str,
+        args: dict[str, Any] | None,
+        started: float,
+        error_type: str | None,
+    ) -> None:
+        """Put the call's outcome on its span and in the turn's audit trail."""
+        hidden = AGENT_ARGS.get(name, set())
+        call: dict[str, Any] = {
+            "name": name,
+            "args": {k: v for k, v in (args or {}).items() if k not in hidden},
+            "ok": error_type is None,
+            "duration_ms": round((time.perf_counter() - started) * 1000, 1),
+        }
+        if error_type is not None:
+            call["error_type"] = error_type
+            span.set_attribute("error.type", error_type)
+            span.set_status(Status(StatusCode.ERROR, error_type))
+        self.invocations.append(call)
+
+
+# Arguments the agent fills itself, never the model: a knowledge search is scoped to the chat
+# the question came from, and offering `session` would let the model aim it at another chat.
+AGENT_ARGS = {"search_knowledge_base": {"session"}}
+
+
+def _as_text(raw: Any) -> str:
+    """One tool result as text: MCP tools answer with a string, content blocks or a model."""
+    if isinstance(raw, str):
+        return raw
+    # str() of a block list handed the model a Python repr with block ids in it
+    if (
+        isinstance(raw, list)
+        and raw
+        and all(isinstance(b, dict) and b.get("type") == "text" for b in raw)
+    ):
+        return "\n".join(str(b.get("text", "")) for b in raw)
+    model_dump = getattr(raw, "model_dump", None)
+    if callable(model_dump):
+        return json.dumps(model_dump(), ensure_ascii=False)
+    return str(raw)
 
 
 def _render_args_schema(tool: BaseTool) -> str:
-    """Render a tool's argument schema as compact JSON for the prompt.
-
-    `BaseTool.args_schema` is typically a pydantic model. We render its
-    JSON schema (just the `properties` map) so the LLM sees field names,
-    types, and descriptions in a familiar shape.
-    """
+    """Render a tool's argument schema as compact JSON for the prompt."""
     args_schema = getattr(tool, "args_schema", None)
     if args_schema is None:
         return "{}"
@@ -136,10 +179,11 @@ def _render_args_schema(tool: BaseTool) -> str:
         else:
             # Already a dict — MCP adapter sometimes hands us raw JSON-schema
             schema = dict(args_schema)
-    except Exception:
+    except (TypeError, ValueError):  # pydantic's PydanticUserError is a TypeError
         return "{}"
-    properties = schema.get("properties") or {}
-    required = set(schema.get("required") or [])
+    hidden = AGENT_ARGS.get(tool.name, set())
+    properties = {k: v for k, v in (schema.get("properties") or {}).items() if k not in hidden}
+    required = set(schema.get("required") or []) - hidden
     if not properties:
         return "{}"
     parts: list[str] = []

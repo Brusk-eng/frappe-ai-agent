@@ -1,6 +1,7 @@
 repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.15.9
+    # keep equal to the ruff in uv.lock: two versions disagree and CI fails where `make lint` passed
+    rev: v0.16.8
     hooks:
       - id: ruff
         args: [--fix]
@@ -15,3 +16,13 @@ repos:
       - id: check-added-large-files
       - id: check-merge-conflict
       - id: detect-private-key
+  - repo: local
+    hooks:
+      # the budget the repository holds itself to: radon ranks A 1-5, B 6-10, C 11-20, and xenon
+      # fails the run when a block is worse than C or the average is worse than A
+      - id: xenon
+        name: complexity budget (xenon)
+        entry: uvx --quiet xenon --max-absolute C --max-average A src
+        language: system
+        files: ^src/.*\.py$
+        pass_filenames: false

@@ -2,22 +2,19 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
 from typing import TYPE_CHECKING
 
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
 from ai_agent.config import Settings
+from ai_agent.observability import request_id as correlation
 
 if TYPE_CHECKING:
     from langchain_core.tools import BaseTool
 
-# MCP tools that frappe-mcp-server keeps for backward compatibility but
-# that we don't want the LLM to invoke. The project-status family was
-# replaced by generic aggregate_documents / run_report flows; surfacing
-# them just gives the LLM a tempting wrong-path option that fails on
-# sites without the corresponding doctypes. Filtered out at the agent
-# boundary (here) rather than in the MCP server itself so the server
-# can keep serving older clients that still depend on them.
+# Kept by frappe-mcp-server for older clients, hidden from the LLM here: they fail on
+# sites without the project doctypes; aggregate_documents and run_report replace them.
 DEPRECATED_TOOLS = frozenset(
     {
         "get_project_status",
@@ -30,31 +27,34 @@ DEPRECATED_TOOLS = frozenset(
 )
 
 
-def build_mcp_client_for_sid(settings: Settings, sid: str) -> MultiServerMCPClient:
-    """Return a new MCP client configured to forward the caller's Frappe sid.
-
-    Every call to this function returns a NEW client. Sharing clients across
-    requests would leak one user's sid into another user's tool calls.
+def build_mcp_client_for_sid(
+    settings: Settings, sid: str, confirmation_token: str | None = None
+) -> MultiServerMCPClient:
+    """A new client per call, forwarding `sid`: shared, it would carry one user's sid to another.
 
     Raises:
-        ValueError: if sid is empty or whitespace-only.
+        ValueError: `sid` is empty or whitespace-only.
     """
     if not sid or not sid.strip():
         raise ValueError("build_mcp_client_for_sid requires a non-empty sid")
+    headers = {"Cookie": f"sid={sid}"}
+    if request_id := correlation.current():
+        headers["X-Request-ID"] = request_id
+    if confirmation_token:
+        headers["X-Frappe-Confirmation"] = confirmation_token
     return MultiServerMCPClient(
         {
             "frappe": {
                 "url": settings.mcp_server_url,
                 "transport": "streamable_http",
-                "headers": {"Cookie": f"sid={sid}"},
+                "headers": headers,
+                "timeout": timedelta(seconds=settings.mcp_tool_timeout_s),
+                # what a stalled tool call waits on; the adapter's own default is 5 minutes
+                "sse_read_timeout": timedelta(seconds=settings.mcp_tool_timeout_s),
             }
         }
     )
 
 
 def filter_deprecated(tools: list[BaseTool]) -> list[BaseTool]:
-    """Drop tools whose name is in `DEPRECATED_TOOLS`.
-
-    Returned list preserves input order; the original list is not mutated.
-    """
     return [t for t in tools if t.name not in DEPRECATED_TOOLS]

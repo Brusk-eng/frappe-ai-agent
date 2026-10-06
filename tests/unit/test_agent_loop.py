@@ -27,6 +27,10 @@ class _FakeRegistry(ToolRegistry):
     def schemas(self) -> str:
         return "(no tools)"
 
+    def writes(self, name: str) -> bool:
+        # scripted reads: the pause a write needs has its own tests
+        return False
+
     def names(self) -> set[str]:
         return set(self._results)
 
@@ -45,7 +49,7 @@ def _fake_llm_with_yields(iterations: list[list[dict[str, Any]]]) -> MagicMock:
     llm = MagicMock()
     iter_queue = list(iterations)
 
-    def _astream(_messages):
+    def _astream(_messages, config=None):
         if not iter_queue:
             raise RuntimeError("test: ran out of scripted iterations")
         partials = iter_queue.pop(0)
@@ -205,9 +209,9 @@ class TestRepeatDetection:
         events = await _drain(
             run_agent_loop(llm=llm, tool_registry=_FakeRegistry(), user_message="hi")
         )
-        # We see 3 tool_call events then the bail-out text.
+        # The third call is stopped before it is announced: 2 tool_call events, then the bail-out.
         kinds = [e["type"] for e in events]
-        assert kinds.count("tool_call") == 3
+        assert kinds.count("tool_call") == 2
         assert kinds[-1] == "content"
         assert "not making progress" in events[-1]["text"].lower()
 
@@ -318,7 +322,7 @@ class TestEmptyEnvelopeDefense:
 class TestLLMError:
     @pytest.mark.asyncio
     async def test_llm_exception_propagates(self):
-        def _raising_astream(_messages):
+        def _raising_astream(_messages, config=None):
             async def _gen():
                 raise RuntimeError("provider down")
                 yield  # unreachable
@@ -398,3 +402,180 @@ class TestStructuredOutputSchemaWiring:
 
         schema, _ = llm.with_structured_output.call_args
         assert self._name_schema(schema[0]) == {"type": "string"}
+
+
+class TestWordByWord:
+    @pytest.mark.asyncio
+    async def test_growing_text_is_sent_as_deltas(self):
+        llm = _fake_llm_with_yields(
+            [
+                [
+                    {"blocks": [{"type": "text", "payload": {"content": "The"}}]},
+                    {"blocks": [{"type": "text", "payload": {"content": "The meal"}}]},
+                    {
+                        "blocks": [
+                            {"type": "text", "payload": {"content": "The meal cap is 45 AUD."}}
+                        ]
+                    },
+                ]
+            ]
+        )
+        events = await _drain(
+            run_agent_loop(llm=llm, tool_registry=_FakeRegistry(), user_message="q")
+        )
+        assert [e["text"] for e in events] == ["The", " meal", " cap is 45 AUD."]
+
+    @pytest.mark.asyncio
+    async def test_structured_block_keeps_its_place_between_text(self):
+        kpi = {
+            "type": "kpi",
+            "payload": {"metrics": [{"label": "Cap", "value": 45, "format": "number"}]},
+        }
+        llm = _fake_llm_with_yields(
+            [
+                [
+                    {"blocks": [{"type": "text", "payload": {"content": "Here:"}}]},
+                    {"blocks": [{"type": "text", "payload": {"content": "Here:"}}, kpi]},
+                    {
+                        "blocks": [
+                            {"type": "text", "payload": {"content": "Here:"}},
+                            kpi,
+                            {"type": "text", "payload": {"content": "Done"}},
+                        ]
+                    },
+                ]
+            ]
+        )
+        events = await _drain(
+            run_agent_loop(llm=llm, tool_registry=_FakeRegistry(), user_message="q")
+        )
+        assert [e["type"] for e in events] == ["content", "content_block", "content"]
+        assert events[1]["block"]["type"] == "kpi"
+
+    @pytest.mark.asyncio
+    async def test_text_before_a_tool_call_stays_as_a_preamble(self):
+        call = {"type": "tool_call", "payload": {"name": "get_count", "arguments": {}}}
+        llm = _fake_llm_with_yields(
+            [
+                [
+                    {"blocks": [{"type": "text", "payload": {"content": "Let me check."}}]},
+                    {"blocks": [{"type": "text", "payload": {"content": "Let me check."}}, call]},
+                ],
+                [{"blocks": [{"type": "text", "payload": {"content": "It is 42."}}]}],
+            ]
+        )
+        events = await _drain(
+            run_agent_loop(
+                llm=llm, tool_registry=_FakeRegistry({"get_count": "42"}), user_message="q"
+            )
+        )
+        assert [e["type"] for e in events] == ["content", "tool_call", "content"]
+        assert events[2]["text"] == "\n\nIt is 42."
+
+
+class TestSources:
+    @pytest.mark.asyncio
+    async def test_knowledge_base_passages_become_a_sources_event(self):
+        call = {
+            "type": "tool_call",
+            "payload": {"name": "search_knowledge_base", "arguments": {"query": "meal"}},
+        }
+        # the registry's rendering of the live MCP reply: summary line, then the JSON array;
+        # the `[` in the query must not be taken for the array
+        passages = (
+            'Found 1 passage(s) for "meal [cap]"\n[{"content":"Meals capped at 45 AUD.",'
+            '"distance":0.21,"file":"abc123","seq":0}]'
+        )
+        llm = _fake_llm_with_yields(
+            [
+                [{"blocks": [call]}],
+                [{"blocks": [{"type": "text", "payload": {"content": "45 AUD."}}]}],
+            ]
+        )
+        events = await _drain(
+            run_agent_loop(
+                llm=llm,
+                tool_registry=_FakeRegistry({"search_knowledge_base": passages}),
+                user_message="q",
+            )
+        )
+        assert [e["type"] for e in events] == ["tool_call", "sources", "content"]
+        assert events[1]["items"] == [
+            {"file": "abc123", "seq": 0, "distance": 0.21, "content": "Meals capped at 45 AUD."}
+        ]
+
+    @pytest.mark.asyncio
+    async def test_no_passages_means_no_sources_event(self):
+        call = {
+            "type": "tool_call",
+            "payload": {"name": "search_knowledge_base", "arguments": {"query": "pets"}},
+        }
+        llm = _fake_llm_with_yields(
+            [
+                [{"blocks": [call]}],
+                [{"blocks": [{"type": "text", "payload": {"content": "Not found."}}]}],
+            ]
+        )
+        events = await _drain(
+            run_agent_loop(
+                llm=llm,
+                tool_registry=_FakeRegistry(
+                    {"search_knowledge_base": 'Found 0 passage(s) for "pets" []'}
+                ),
+                user_message="q",
+            )
+        )
+        assert [e["type"] for e in events] == ["tool_call", "content"]
+
+
+class TestChatScope:
+    @pytest.mark.asyncio
+    async def test_every_knowledge_search_is_scoped_to_this_chat(self):
+        """The model may write any session it likes; the agent's own chat id replaces it."""
+        call = {
+            "type": "tool_call",
+            "payload": {
+                "name": "search_knowledge_base",
+                "arguments": {"query": "code", "session": "not-mine"},
+            },
+        }
+        llm = _fake_llm_with_yields(
+            [[{"blocks": [call]}], [{"blocks": [{"type": "text", "payload": {"content": "ok"}}]}]]
+        )
+        registry = _FakeRegistry({"search_knowledge_base": "Found 0 passage(s)"})
+        await _drain(
+            run_agent_loop(llm=llm, tool_registry=registry, user_message="q", session="mine")
+        )
+        assert registry.calls == [("search_knowledge_base", {"query": "code", "session": "mine"})]
+
+    @pytest.mark.asyncio
+    async def test_an_attached_file_keeps_its_name_in_sources(self):
+        call = {
+            "type": "tool_call",
+            "payload": {"name": "search_knowledge_base", "arguments": {"query": "q"}},
+        }
+        passages = (
+            'Found 1 passage(s) for "q"\n'
+            '[{"content":"PELICAN-7","distance":0.1,"file":"f1","seq":0,'
+            '"file_name":"zephyr.txt","attachment":true}]'
+        )
+        llm = _fake_llm_with_yields(
+            [[{"blocks": [call]}], [{"blocks": [{"type": "text", "payload": {"content": "ok"}}]}]]
+        )
+        events = await _drain(
+            run_agent_loop(
+                llm=llm,
+                tool_registry=_FakeRegistry({"search_knowledge_base": passages}),
+                user_message="q",
+            )
+        )
+        assert events[1]["items"] == [
+            {
+                "file": "f1",
+                "seq": 0,
+                "distance": 0.1,
+                "content": "PELICAN-7",
+                "file_name": "zephyr.txt",
+                "attachment": True,
+            }
+        ]

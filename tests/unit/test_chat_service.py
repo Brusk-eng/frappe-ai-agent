@@ -9,6 +9,7 @@ orchestration. Loop behaviour has its own test file.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -17,8 +18,9 @@ import pytest
 import structlog
 
 from ai_agent.config import Settings
+from ai_agent.integrations.frappe_history import FrappeHistoryClient
 from ai_agent.middleware.sid import UserContext
-from ai_agent.services.chat import ChatService
+from ai_agent.services.chat import ANSWER_FAILED, ChatService
 
 
 def _make_settings() -> Settings:
@@ -31,11 +33,22 @@ def _make_settings() -> Settings:
     )
 
 
+def _fake_history() -> MagicMock:
+    """A history client that answers from memory; spec'd, so its async methods are AsyncMocks."""
+    history = MagicMock(spec=FrappeHistoryClient)
+    history.create_session.return_value = "sess-fake"
+    history.ensure_session.side_effect = lambda *, name, **_: name
+    history.save_message.return_value = "msg-fake"
+    history.list_messages.return_value = []
+    return history
+
+
 def _make_service() -> ChatService:
     return ChatService(
         settings=_make_settings(),
         llm=MagicMock(),
         system_prompt_builder=lambda _ctx: "you are helpful",
+        history=_fake_history(),
     )
 
 
@@ -331,10 +344,8 @@ async def test_session_event_announces_created_session_id():
     service = _make_service()
     user_context = UserContext(sid="abc123")
 
-    fake_history = MagicMock()
-    fake_history.create_session = AsyncMock(return_value="sess-created")
-    fake_history.save_message = AsyncMock(return_value="msg-1")
-    fake_history.ensure_session = AsyncMock(side_effect=lambda *, name, **_: name)
+    fake_history = _fake_history()
+    fake_history.create_session.return_value = "sess-created"
     service._history = fake_history
 
     mock_client = MagicMock()
@@ -360,10 +371,8 @@ async def test_session_event_echoes_existing_session_id():
     service = _make_service()
     user_context = UserContext(sid="abc123")
 
-    fake_history = MagicMock()
-    fake_history.create_session = AsyncMock(return_value="should-not-use")
-    fake_history.save_message = AsyncMock(return_value="msg-1")
-    fake_history.ensure_session = AsyncMock(side_effect=lambda *, name, **_: name)
+    fake_history = _fake_history()
+    fake_history.create_session.return_value = "should-not-use"
     service._history = fake_history
 
     mock_client = MagicMock()
@@ -508,7 +517,7 @@ async def test_loop_exception_surfaces_as_error_event():
 
     error_events = [e for e in events if e["type"] == "error"]
     assert len(error_events) == 1
-    assert "loop blew up" in error_events[0]["message"]
+    assert error_events[0]["message"] == ANSWER_FAILED  # C26: the text stays in the log
     assert events[-1]["type"] == "done"
     assert events[-1]["data_quality"] == "low"
 
@@ -523,10 +532,7 @@ async def test_handle_message_persists_user_message_before_loop():
     service = _make_service()
     user_context = UserContext(sid="abc123")
 
-    fake_history = MagicMock()
-    fake_history.create_session = AsyncMock(return_value="sess-1")
-    fake_history.ensure_session = AsyncMock(side_effect=lambda *, name, **_: name)
-    fake_history.save_message = AsyncMock(return_value="msg-1")
+    fake_history = _fake_history()
     service._history = fake_history
 
     mock_client = MagicMock()
@@ -557,10 +563,9 @@ async def test_handle_message_continues_when_history_writes_fail():
     service = _make_service()
     user_context = UserContext(sid="abc123")
 
-    fake_history = MagicMock()
-    fake_history.create_session = AsyncMock(return_value="sess-1")
-    fake_history.ensure_session = AsyncMock(side_effect=lambda *, name, **_: name)
-    fake_history.save_message = AsyncMock(side_effect=RuntimeError("frappe down"))
+    fake_history = _fake_history()
+    # what the client returns when Frappe refuses the write; it never raises for that
+    fake_history.save_message.return_value = None
     service._history = fake_history
 
     mock_client = MagicMock()
@@ -579,9 +584,10 @@ async def test_handle_message_continues_when_history_writes_fail():
             )
         )
 
-    # Stream finishes despite history write failures.
+    # Stream finishes despite history write failures, and says so.
     assert events[-1]["type"] == "done"
     assert [e for e in events if e["type"] == "error"] == []
+    assert events[-1]["data_quality"] == "low"  # nothing was saved; the answer cannot claim high
 
 
 # --------------------------------------------------------------------------- #
@@ -895,10 +901,7 @@ async def test_handle_message_aclose_mid_stream_does_not_raise():
     service = _make_service()
     user_context = UserContext(sid="abc123")
 
-    fake_history = MagicMock()
-    fake_history.create_session = AsyncMock(return_value="s-aclose")
-    fake_history.save_message = AsyncMock(return_value="m1")
-    fake_history.ensure_session = AsyncMock(side_effect=lambda *, name, **_: name)
+    fake_history = _fake_history()
     service._history = fake_history
 
     mock_client = MagicMock()
@@ -929,3 +932,103 @@ async def test_handle_message_aclose_mid_stream_does_not_raise():
             await agen.aclose()
         except RuntimeError as e:  # pragma: no cover
             pytest.fail(f"aclose raised: {e}")
+
+
+async def test_assistant_message_keeps_sources_and_blocks():
+    """Blocks and passages used to vanish on reload; a passage is kept as a reference (D08)."""
+    service = _make_service()
+    fake_history = _fake_history()
+    service._history = fake_history
+    mock_client = MagicMock()
+    mock_client.get_tools = AsyncMock(return_value=[])
+    item = {"file": "abc123", "seq": 0, "distance": 0.2, "content": "Meals capped."}
+    block = {"type": "kpi", "metrics": [{"label": "Cap", "value": 45, "format": "number"}]}
+    loop_events = [
+        {"type": "sources", "items": [item]},
+        {"type": "content", "text": "45 AUD."},
+        {"type": "content_block", "block": block},
+    ]
+    with (
+        patch("ai_agent.services.chat.build_mcp_client_for_sid", return_value=mock_client),
+        patch("ai_agent.services.chat.run_agent_loop", _loop_factory(loop_events)),
+    ):
+        events = await _drain(
+            service.handle_message(
+                message="cap?",
+                session_id="s-src",
+                context={},
+                user_context=UserContext(sid="abc123"),
+            )
+        )
+    from ai_agent.transport.sse_events import validate_event
+
+    for ev in events:
+        validate_event(ev)
+    saved = fake_history.save_message.call_args_list[-1].kwargs
+    kept = json.loads(saved["tool_result_json"])
+    assert kept.pop("usage").keys() == {"first_token_s"}  # the answer's text had a first moment
+    ref = {"file": item["file"], "seq": item["seq"], "distance": None}
+    assert kept == {"sources": [ref], "blocks": [block]}
+
+
+@pytest.mark.asyncio
+async def test_ollama_decode_counts_reach_done_and_history():
+    """Ollama times the tokens it writes; a turn's calls are summed so the UI can show tokens/s."""
+    from langchain_core.messages import AIMessage
+    from langchain_core.outputs import ChatGeneration, LLMResult
+
+    def _factory(**kwargs):
+        async def _gen():
+            for tokens, nanos in ((100, 2_000_000_000), (50, 1_000_000_000)):
+                meta = {"eval_count": tokens, "eval_duration": nanos}
+                result = LLMResult(
+                    generations=[
+                        [ChatGeneration(message=AIMessage(content="", response_metadata=meta))]
+                    ]
+                )
+                for cb in kwargs["callbacks"]:
+                    await cb.on_llm_end(result)
+            yield {"type": "content", "text": "ok"}
+
+        return _gen()
+
+    service = _make_service()
+    service._history = _fake_history()
+    mock_client = MagicMock()
+    mock_client.get_tools = AsyncMock(return_value=[])
+    with (
+        patch("ai_agent.services.chat.build_mcp_client_for_sid", return_value=mock_client),
+        patch("ai_agent.services.chat.run_agent_loop", _factory),
+    ):
+        events = await _drain(
+            service.handle_message(
+                message="hi", session_id="s1", context={}, user_context=UserContext(sid="abc123")
+            )
+        )
+
+    usage = events[-1]["usage"]
+    assert (usage["output_tokens"], usage["output_seconds"]) == (150, 3.0)
+    assert usage["first_token_s"] >= 0, "when the first answer text went out, after the turn began"
+    saved = service._history.save_message.call_args_list[-1].kwargs["tool_result_json"]
+    assert json.loads(saved)["usage"] == usage
+
+
+@pytest.mark.asyncio
+async def test_no_decode_timing_means_no_speed():
+    """Hosted providers report no decode time; the done event then claims no speed."""
+    mock_client = MagicMock()
+    mock_client.get_tools = AsyncMock(return_value=[])
+    with (
+        patch("ai_agent.services.chat.build_mcp_client_for_sid", return_value=mock_client),
+        patch(
+            "ai_agent.services.chat.run_agent_loop",
+            _loop_factory([{"type": "content", "text": "ok"}]),
+        ),
+    ):
+        events = await _drain(
+            _make_service().handle_message(
+                message="hi", session_id="s1", context={}, user_context=UserContext(sid="abc123")
+            )
+        )
+    # no speed without the model's own timing, but the first answer text still has a time
+    assert set(events[-1]["usage"]) == {"first_token_s"}

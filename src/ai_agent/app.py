@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 from contextlib import asynccontextmanager
+from importlib.metadata import version
 
 import structlog
 from fastapi import FastAPI, Request
-from fastapi.middleware.cors import CORSMiddleware
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
@@ -27,36 +28,25 @@ logger = structlog.get_logger()
 
 
 def _sid_or_ip_key(request: Request) -> str:
-    """Key function for slowapi — prefer caller's sid, fall back to IP.
-
-    Why: the chat route 401s without a sid, so sid will normally be present.
-    The IP fallback covers any future endpoints we decorate.
-
-    The returned string is a rate-limit bucket id consumed by slowapi
-    internally — it is never rendered to a browser, so the Flask-route
-    XSS rule semgrep flags here doesn't apply.
-    """
+    """Key function for slowapi — prefer caller's sid, fall back to IP."""
     # slowapi rate-limit key — return value is never rendered to a client,
     # so semgrep's Flask directly-returned-format-string rule (which fires
     # below) is a false positive. nosem suppressions kept on the same lines.
     sid = request.cookies.get("sid")
     if sid and sid.strip():
-        return "sid:" + sid  # nosem
+        # slowapi logs this key on every 429, so it must not be the credential itself
+        return "sid:" + hashlib.sha256(sid.encode()).hexdigest()  # nosem
     return "ip:" + get_remote_address(request)  # nosem
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
-    """Create the FastAPI application."""
     if settings is None:
         settings = Settings()
 
     setup_logging(level=settings.log_level, log_format=settings.log_format)
 
-    # Services + routers are bound at factory time, not during startup.
-    # Why: routers wired inside `lifespan` are invisible to anything that
-    # inspects `app.routes` before the first request (tests, OpenAPI
-    # scrapers). All construction here is in-process and synchronous
-    # (no network I/O — ChatService builds its MCP client per request).
+    # Built here, not in lifespan: routes wired there are missing from app.routes until the
+    # first request. Keep this construction free of network I/O.
     llm = create_llm(settings)
     chat_service = ChatService(
         settings=settings,
@@ -64,22 +54,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         system_prompt_builder=build_system_prompt,
     )
     health_service = HealthService(settings=settings)
-    limiter = Limiter(key_func=_sid_or_ip_key)
+    limiter = Limiter(key_func=_sid_or_ip_key, storage_uri=settings.rate_limit_storage_uri)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        logger.info("starting", port=settings.port, model=settings.llm_model)
-
-        # OTEL is the one piece that legitimately needs startup timing —
-        # the exporter background thread is what we don't want spinning up
-        # in tests that construct the app for introspection only.
-        if settings.otel_endpoint:
-            create_tracer_provider(
-                endpoint=settings.otel_endpoint,
-                service_name=settings.otel_service_name,
-            )
-            FastAPIInstrumentor.instrument_app(app)
-
+        logger.info("starting", model=settings.llm_model)
         logger.info("started")
         try:
             yield
@@ -92,30 +71,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(
         title="Frappe AI Agent",
-        version="0.1.0",
+        version=version("frappe-ai-agent"),
         lifespan=lifespan,
+        openapi_url=None,
     )
 
-    # slowapi: register the 429 handler. Why no SlowAPIMiddleware: the
-    # middleware runs the limit check before FastAPI dependency resolution,
-    # so unauthenticated requests would burn a token before the sid-check
-    # 401s. Without the middleware, the @limiter.limit decorator performs
-    # the check inside the wrapped function — i.e. after Depends() runs.
+    # Not in the lifespan: instrument_app only patches build_middleware_stack, and Starlette
+    # has already called and cached it (starlette/applications.py:88) by then — the lifespan
+    # scope is itself the first ASGI call, so no HTTP span would ever be created.
+    if settings.otel_endpoint:
+        create_tracer_provider(
+            endpoint=settings.otel_endpoint,
+            service_name=settings.otel_service_name,
+        )
+        FastAPIInstrumentor.instrument_app(app)
+
+    # No SlowAPIMiddleware: it runs before Depends(), so requests without a valid sid would
+    # spend tokens before their 401; @limiter.limit checks after Depends().
     app.state.limiter = limiter
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)  # type: ignore[arg-type]
 
-    # Middleware
-    # Credentialed CORS: the Frappe frontend forwards the `sid` cookie so the
-    # agent can authenticate the caller against Frappe. That requires an
-    # explicit origin list (no "*", enforced by config.py) and
-    # allow_credentials=True.
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=settings.cors_origins,
-        allow_credentials=True,
-        allow_methods=["POST", "GET", "OPTIONS"],
-        allow_headers=["*"],
-    )
+    # Middleware. No CORS layer: every caller is server to server (ADR-023).
     app.add_middleware(RequestIDMiddleware)
 
     # Routers

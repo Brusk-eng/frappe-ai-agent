@@ -6,60 +6,71 @@ import json
 from collections.abc import Callable
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from slowapi import Limiter
 
-from ai_agent.middleware.sid import UserContext, extract_user_context
+# tests override the agent's auth by this name; keep it importable from here
+from ai_agent.middleware.sid import UserContext
+from ai_agent.middleware.sid import require_sid as _require_sid
 from ai_agent.transport.sse_events import serialize
 
-
-def _require_sid(request: Request) -> UserContext:
-    """Why: FastAPI Depends() runs before the @limiter.limit decorator's
-    rate-limit check, so unauthenticated callers 401 without consuming a
-    token from the (IP-keyed) bucket — preventing one bad actor from
-    locking out a shared NAT.
-    """
-    user_context = extract_user_context(request)
-    if user_context is None:
-        raise HTTPException(status_code=401, detail="Missing sid cookie")
-    return user_context
-
-
-# Why: `context` is forwarded into the system prompt; an unbounded dict lets
-# a misbehaving frontend (or a malicious caller) blow up token usage per
-# request. 8 KB is enough for page context (doctype/docname/route/currency
-# and a few extras) while keeping the prompt budget predictable.
+# context goes into the system prompt, so this caps the tokens one request can spend.
 _MAX_CONTEXT_BYTES = 8 * 1024
 
 
+def _capped(value: dict[str, Any], field: str) -> dict[str, Any]:
+    """Reject a JSON object over the prompt's byte budget: one request cannot fill the context."""
+    try:
+        encoded = json.dumps(value).encode()
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field} must be JSON-serialisable: {exc}") from exc
+    if len(encoded) > _MAX_CONTEXT_BYTES:
+        raise ValueError(
+            f"{field} exceeds {_MAX_CONTEXT_BYTES} bytes (got {len(encoded)} bytes serialised)"
+        )
+    return value
+
+
+class Confirmation(BaseModel):
+    """A write the user allowed: the call frappe_ai recorded, and the one-time token for it."""
+
+    tool: str = Field(min_length=1, max_length=200)
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    token: str = Field(min_length=1, max_length=512)
+
+    @field_validator("arguments")
+    @classmethod
+    def _cap_arguments_size(cls, v: dict[str, Any]) -> dict[str, Any]:
+        return _capped(v, "confirmation.arguments")
+
+
 class ChatRequest(BaseModel):
-    message: str = Field(min_length=1, max_length=32_000)
+    message: Annotated[str, Field(min_length=1, max_length=32_000)] | None = None
     session_id: str | None = None
     context: dict[str, Any] = Field(default_factory=dict)
+    confirmation: Confirmation | None = None
 
     @field_validator("message")
     @classmethod
-    def _reject_whitespace_only(cls, v: str) -> str:
+    def _reject_whitespace_only(cls, v: str | None) -> str | None:
         # `min_length=1` alone accepts "   "; strip-check rejects it without
         # mutating the value (so the LLM sees exactly what the user typed).
-        if not v.strip():
+        if v is not None and not v.strip():
             raise ValueError("message must not be whitespace-only")
         return v
 
     @field_validator("context")
     @classmethod
     def _cap_context_size(cls, v: dict[str, Any]) -> dict[str, Any]:
-        try:
-            encoded = json.dumps(v).encode()
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"context must be JSON-serialisable: {exc}") from exc
-        if len(encoded) > _MAX_CONTEXT_BYTES:
-            raise ValueError(
-                f"context exceeds {_MAX_CONTEXT_BYTES} bytes (got {len(encoded)} bytes serialised)"
-            )
-        return v
+        return _capped(v, "context")
+
+    @model_validator(mode="after")
+    def _one_of_message_or_confirmation(self) -> ChatRequest:
+        if (self.message is None) == (self.confirmation is None):
+            raise ValueError("send either message or confirmation, not both and not neither")
+        return self
 
 
 def _noop_limit(_fn: Callable) -> Callable:
@@ -72,12 +83,7 @@ def create_sse_router(
     limiter: Limiter | None = None,
     rate_limit: str = "30/minute",
 ) -> APIRouter:
-    """Build the SSE chat router.
-
-    `limiter` is optional so test bootstrap code (BDD scenarios that don't
-    go through `create_app`) can wire the router directly. In production
-    `create_app` always passes a real limiter.
-    """
+    """Build the SSE chat router; `limiter` is optional only for tests that skip create_app."""
     router = APIRouter()
     limit = limiter.limit(rate_limit) if limiter is not None else _noop_limit
 
@@ -99,6 +105,7 @@ def create_sse_router(
                 session_id=body.session_id,
                 context=body.context,
                 user_context=user_context,
+                confirmation=body.confirmation.model_dump() if body.confirmation else None,
             ):
                 yield serialize(event)
 

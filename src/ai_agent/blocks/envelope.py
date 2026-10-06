@@ -1,30 +1,11 @@
-"""JSON-envelope strategy for constrained-decoding LLMs.
-
-Small Ollama models (≤4B) cannot reliably emit `<ai-block type="...">{...JSON...}
-</ai-block>` markup directly — they leak markdown fences, miss closing tags, and
-mangle inline JSON. To make them production-safe we instead ask them to emit a
-JSON envelope shaped like:
-
-    {"blocks": [{"type": "table", "payload": {...}}, ...]}
-
-and enforce it at the token level via Ollama's `format=<schema>` constrained-
-decoding hook. The envelope's per-type payload schemas mirror the pydantic
-block models (ChartBlock, TableBlock, etc.) closely enough that downstream
-validation rarely catches anything.
-
-`envelope_to_markup` translates a model response (raw JSON or JSON wrapped in
-prose / `​```json` fence) back into the `<ai-block>` markup that
-`ai_agent.blocks.parser.parse_blocks` expects, so the downstream parser and
-streaming splitter remain unchanged.
-"""
+"""The JSON envelope enforced by constrained decoding, and its translation to <ai-block> markup."""
 
 from __future__ import annotations
 
 import copy
 import json
 import re
-from collections.abc import Iterator
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -38,7 +19,6 @@ __all__ = [
     "block_envelope_schema",
     "build_agent_messages",
     "envelope_to_markup",
-    "iter_complete_blocks",
 ]
 
 
@@ -200,16 +180,9 @@ _STATUS_LIST_PAYLOAD: dict = {
     "additionalProperties": False,
 }
 
-# The envelope uses `oneOf` per block type so Ollama (via llama.cpp's JSON-
-# schema-to-GBNF grammar) enforces per-type payload shape at every token. This
-# is what stops small models from echoing JSON-schema-like nested objects into
-# payloads (a real failure mode on smollm2:1.7b at A5 in the prior baseline).
-#
-# `title` and `description` are required when this schema is routed through
-# providers that map structured output → function calling (langchain-openai
-# does this for the `openai` provider, including when pointed at Ollama's
-# OpenAI-compat layer). The values become the function name / description.
-# Ollama's native grammar generator treats both as metadata and ignores them.
+# oneOf per block type lets Ollama's grammar enforce each payload's shape at every token;
+# small models echo schema-like objects into payloads without it. title and description
+# are required by providers that map structured output to function calling (langchain-openai).
 BLOCK_ENVELOPE_SCHEMA: dict = {
     "title": "BlockEnvelope",
     "description": (
@@ -279,10 +252,8 @@ BLOCK_ENVELOPE_SCHEMA: dict = {
 def block_envelope_schema(tool_names: set[str] | None = None) -> dict:
     """`BLOCK_ENVELOPE_SCHEMA` with `tool_call.payload.name` pinned to `tool_names`.
 
-    The base schema types `name` as a bare string, so `""` is schema-valid and
-    unexecutable. Pinning the enum makes it unreachable at the token level.
-    An empty set returns the shared constant: `enum: []` admits no value and
-    Ollama then emits invalid JSON. Treat the result as read-only.
+    Returns:
+        A copy, or for no names the shared constant itself (`enum: []` breaks Ollama): read-only.
     """
     if not tool_names:
         return BLOCK_ENVELOPE_SCHEMA
@@ -305,16 +276,10 @@ TOOL_CALL_TYPE = "tool_call"
 
 
 def envelope_to_markup(raw: str) -> str:
-    """Translate a JSON envelope LLM response into `<ai-block>` markup.
+    """Translate a model's JSON envelope, bare or in a fence or prose, into `<ai-block>` markup.
 
-    Handles three real model behaviors:
-    - bare JSON (the happy path under `format=` constrained decoding)
-    - JSON wrapped in `​```json` fences or prose (Gemma 3 4B is documented to
-      add commentary around the JSON even with constrained decoding)
-    - text-block-only envelopes (translate to bare prose; the parser treats
-      orphan prose as a TextBlock)
-
-    Raises ValueError on empty input or input that contains no JSON object.
+    Raises:
+        ValueError: the input is empty, holds no JSON object, or the object has no `blocks`.
     """
     if not raw or not raw.strip():
         raise ValueError("empty response")
@@ -340,10 +305,7 @@ def envelope_to_markup(raw: str) -> str:
         if not isinstance(payload, dict):
             continue
         if btype == TOOL_CALL_TYPE:
-            # tool_call blocks are agent-loop machinery, never user-visible
-            # markup. They're skipped here so callers can pass a full
-            # envelope (including tool_calls already-executed) through
-            # without leaking machinery into the FE.
+            # Loop machinery, never shown: callers may pass tool_calls that already ran.
             continue
         if btype == "text":
             content = str(payload.get("content") or "")
@@ -376,9 +338,10 @@ Each block is one of: tool_call | text | table | chart | kpi | status_list.
 - To fetch data: emit a `tool_call` block. The system runs the tool and
   replies with the result in the next user-role message; you then emit
   another envelope (more tool calls, or your final answer).
-- To answer the user: emit text/table/chart/kpi/status_list blocks. Once
-  ANY non-tool-call block appears in your response, the loop ends and
-  those blocks become the answer rendered to the user.
+- To answer the user: emit text/table/chart/kpi/status_list blocks. A
+  response with no tool_call block ends the loop, and its blocks are the
+  answer rendered to the user. Blocks beside a tool_call are shown to the
+  user too, before the tool runs.
 
 ## Block payloads
 
@@ -533,14 +496,7 @@ def build_agent_messages(
     history: list[BaseMessage] | None = None,
     system_prompt: str = UNIFIED_AGENT_SYSTEM_PROMPT,
 ) -> list[BaseMessage]:
-    """Compose the initial messages list for the unified agent loop.
-
-    `tools_catalog` is a stringified list of available tools (name +
-    description + JSON-schema args) injected into the system message so
-    the model knows what it can call. `context_preamble` carries the
-    per-request page/currency/date context from `build_system_prompt`.
-    `history` is prior turns from `FrappeHistoryClient` if any.
-    """
+    """Compose the initial messages list for the unified agent loop."""
     parts: list[str] = [system_prompt]
     if context_preamble:
         parts.append("\n# Request context\n\n" + context_preamble.strip())
@@ -552,54 +508,3 @@ def build_agent_messages(
         msgs.extend(history)
     msgs.append(HumanMessage(content=user_message))
     return msgs
-
-
-# --------------------------------------------------------------------------- #
-# Streaming: detect newly-completed blocks across partial-dict yields
-# --------------------------------------------------------------------------- #
-
-
-def iter_complete_blocks(
-    partial: dict[str, Any] | None,
-    state: dict[str, Any],
-    *,
-    final: bool = False,
-) -> Iterator[dict[str, Any]]:
-    """Yield block dicts that have JUST completed in `partial`.
-
-    The `with_structured_output().astream()` API emits a dict snapshot on
-    every token. We want to detect when a particular block index has
-    transitioned from "still streaming" to "definitely closed" so we can
-    translate it to ai-block markup and emit a content_block event.
-
-    The reliable signal is "the NEXT block has started" (or it's the
-    final yield). At that point the closing brace of the current block
-    has arrived; partial-JSON parsing for numbers (digit-by-digit) is
-    only known-done when followed by a structural token.
-
-    `state` is a mutable dict the caller passes across yields. It tracks
-    which indices have been emitted so we don't re-yield.
-    """
-    state.setdefault("emitted", set())
-    if not isinstance(partial, dict):
-        return
-    blocks = partial.get("blocks")
-    if not isinstance(blocks, list):
-        return
-    n = len(blocks)
-    for i, b in enumerate(blocks):
-        if i in state["emitted"]:
-            continue
-        # Block at index i is "done" when:
-        # - a later block (i+1, etc.) has started in the partial — its
-        #   closing brace must have arrived for the next object to open,
-        # - OR we're at the final yield (entire envelope closed).
-        next_started = i < n - 1
-        if not (next_started or final):
-            continue
-        if not isinstance(b, dict) or "type" not in b or "payload" not in b:
-            # Malformed block — skip but mark emitted so we don't loop.
-            state["emitted"].add(i)
-            continue
-        state["emitted"].add(i)
-        yield b

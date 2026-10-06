@@ -139,3 +139,51 @@ class TestAinvoke:
         reg = ToolRegistry([_no_args])
         result = await reg.ainvoke("_no_args", None)
         assert result == "ok"
+
+
+class TestMcpContentBlocks:
+    """langchain-mcp-adapters returns MCP content as a list of text blocks. str() of that list
+    handed the model a Python repr with block ids in it, and hid the JSON inside it."""
+
+    @pytest.mark.asyncio
+    async def test_text_blocks_become_their_text(self):
+        @tool
+        def _search(query: str) -> list:
+            """Search."""
+            return [
+                {"type": "text", "text": f'Found 1 passage(s) for "{query}"', "id": "lc_1"},
+                {"type": "text", "text": '[{"file":"abc","seq":0}]', "id": "lc_2"},
+            ]
+
+        result = await ToolRegistry([_search]).ainvoke("_search", {"query": "cap"})
+        assert result == 'Found 1 passage(s) for "cap"\n[{"file":"abc","seq":0}]'
+
+    @pytest.mark.asyncio
+    async def test_other_blocks_keep_the_old_rendering(self):
+        @tool
+        def _image() -> list:
+            """Image."""
+            return [{"type": "image", "data": "x"}]
+
+        assert await ToolRegistry([_image]).ainvoke("_image", {}) == str(
+            [{"type": "image", "data": "x"}]
+        )
+
+
+class _SearchArgs(BaseModel):
+    query: str = Field(description="The question")
+    session: str = Field(default="", description="The chat")
+
+
+@tool("search_knowledge_base", args_schema=_SearchArgs)
+def _search(query: str, session: str = "") -> str:
+    """Search documents."""
+    return query
+
+
+def test_the_model_never_sees_the_chat_it_searches():
+    """The agent fills `session` with the chat the question came from; offering it to the
+    model would let it point a search at another chat."""
+    rendered = ToolRegistry([_search]).schemas()
+    assert "query" in rendered
+    assert "session" not in rendered

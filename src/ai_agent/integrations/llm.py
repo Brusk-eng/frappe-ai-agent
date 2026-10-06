@@ -10,25 +10,11 @@ from ai_agent.config import Settings
 
 
 def create_llm(settings: Settings) -> BaseChatModel:
-    """Create a chat model from settings. Provider-agnostic."""
     provider = settings.llm_provider.lower()
 
     if provider == "ollama":
-        # Explicit branch for Ollama: avoids coupling to init_chat_model's
-        # provider routing and keeps the dependency on langchain-ollama explicit.
-        # `num_predict` is Ollama's max-output-tokens knob; `num_ctx` is the
-        # context window. Without setting num_ctx, Ollama defaults to 2048
-        # which is too small for our system prompt + tool results + answer
-        # and causes the model to silently truncate earlier context, producing
-        # garbled mid-response output (e.g. "A$6,neakers" splice bug).
-        #
-        # `repeat_penalty=1.0` disables Ollama's repeated-token penalty
-        # (default 1.1). For structured JSON output that penalty hurts —
-        # closing braces, commas, and quote characters legitimately recur
-        # and the down-weighting can push the sampler off the correct
-        # next token. `top_k=1` forces pure greedy decoding even when
-        # the backend still samples at temperature=0. Combined, these
-        # make small-model structured output reliably deterministic.
+        # repeat_penalty=1.0: a Modelfile's penalty (lfm2.5 sets 1.05) down-weights the braces,
+        # commas and quotes JSON repeats. top_k=1 makes decoding greedy whatever the temperature.
         return ChatOllama(
             model=settings.llm_model,
             base_url=settings.llm_base_url,
@@ -37,6 +23,8 @@ def create_llm(settings: Settings) -> BaseChatModel:
             num_ctx=settings.llm_num_ctx,
             repeat_penalty=1.0,
             top_k=1,
+            # the only way into the httpx client under ollama's, which defaults to timeout=None
+            client_kwargs={"timeout": settings.llm_request_timeout_s},
         )
 
     return init_chat_model(
@@ -46,4 +34,5 @@ def create_llm(settings: Settings) -> BaseChatModel:
         api_key=settings.llm_api_key or None,
         temperature=settings.llm_temperature,
         max_tokens=settings.llm_max_tokens,
+        timeout=settings.llm_request_timeout_s,
     )

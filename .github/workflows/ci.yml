@@ -7,36 +7,54 @@ on:
     branches: [main, develop]
   workflow_dispatch:  # enables manual run of the `integration` job below
 
+# the build job widens this to packages: write; nothing else needs more than read
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # not on main: cancelling there would kill the build job in the middle of its push
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 jobs:
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v6
-      - uses: astral-sh/setup-uv@v8.1.0
-      - run: uv sync --all-extras
-      - run: uv run ruff check src/ tests/
-      - run: uv run ruff format --check src/ tests/
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b  # v8.1.0
+      - run: uv sync --locked --all-extras
+      - run: make lint
+      - run: make boundaries
+      - run: uvx pre-commit run --all-files
 
   typecheck:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v6
-      - uses: astral-sh/setup-uv@v8.1.0
-      - run: uv sync --all-extras
-      - run: uv run pyright
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b  # v8.1.0
+      - run: uv sync --locked --all-extras
+      - run: make typecheck
 
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v6
-      - uses: astral-sh/setup-uv@v8.1.0
-      - run: uv sync --all-extras
-      # --cov-fail-under: hard floor so a coverage regression breaks
-      # CI instead of silently merging. 95% is well below today's
-      # ~98% but well above what counts as "real test coverage";
-      # bump if/when the project reliably stays higher.
-      - run: uv run pytest tests/unit/ tests/features/ -v --cov=ai_agent --cov-report=xml --cov-fail-under=95
-      - uses: codecov/codecov-action@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b  # v8.1.0
+      - run: uv sync --locked --all-extras
+      # No --cov-fail-under in `make test`. A percentage pays for a line executed, not for a
+      # line asserted, so the cheapest way to meet a floor is a test with no assertion in it.
+      # Coverage is still measured and uploaded: the report below is where a drop is judged.
+      - run: make test
+      - uses: codecov/codecov-action@8cad3ba95e5920c42f44492e54bc9639cba47959  # v6.0.2
         with:
           files: coverage.xml
 
@@ -48,15 +66,19 @@ jobs:
     timeout-minutes: 30
     needs: [lint, typecheck]
     env:
-      # Versions / model pinned here so a single edit moves the whole job.
-      FRAPPE_BRANCH: version-15
-      FRAPPE_PY: "3.12"
+      # What ragbot's Makefile, compose.demo.yaml and apps.json ship; one edit moves the job
+      FRAPPE_BRANCH: version-16
+      FRAPPE_PY: "3.14"
       OLLAMA_MODEL: qwen3:0.6b
+      OLLAMA_IMAGE: ollama/ollama:0.34.1
       MCP_REPO: vyogotech/frappe-mcp-server
+      MCP_REF: main
       FRAPPE_AI_REPO: vyogotech/frappe_ai
+      # a branch because apps.json is too; keep it equal to the branch apps.json installs
+      FRAPPE_AI_REF: main
     services:
       mariadb:
-        image: mariadb:10.6
+        image: mariadb:12.3.3
         env:
           MARIADB_ROOT_PASSWORD: travis
         ports:
@@ -67,40 +89,43 @@ jobs:
           --health-timeout 5s
           --health-retries 10
       redis-cache:
-        image: redis:alpine
+        image: redis:8.6-alpine
         ports:
           - 13000:6379
       redis-queue:
-        image: redis:alpine
+        image: redis:8.6-alpine
         ports:
           - 11000:6379
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+        with:
+          persist-credentials: false
 
       - name: Set up Python ${{ env.FRAPPE_PY }} (Frappe + agent share one interp)
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
         with:
           python-version: ${{ env.FRAPPE_PY }}
 
       # nopt@10 in frappe_ai's yarn tree needs >=22.22.2; 24 also meets
       # frappe version-16's engines (>=24).
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38  # v6.5.0
         with:
           node-version: "24"
 
-      # Stay on v5: setup-go@v6 sets GOTOOLCHAIN=local, which prevents
-      # the auto-toolchain download Go 1.21+ does for go.mod files that
-      # require a newer Go than the one setup-go installed. The build
-      # target — vyogotech/frappe-mcp-server — declares `go 1.25.0` in
-      # its go.mod (verified 2026-05-13). With v6 + go-version: "1.23"
-      # the build would fail; v5 still works because v5 lets Go fetch
-      # 1.25 at build time. Bump alongside go-version: "1.25" when both
-      # are touched together.
-      - uses: actions/setup-go@v5
+      - name: Fetch frappe-mcp-server
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
         with:
-          go-version: "1.23"
+          repository: ${{ env.MCP_REPO }}
+          ref: ${{ env.MCP_REF }}
+          path: mcp-src
+          persist-credentials: false
 
-      - uses: astral-sh/setup-uv@v8.1.0
+      # go-version-file needs mcp-src on disk, so the checkout above comes first
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16  # v6.5.0
+        with:
+          go-version-file: mcp-src/go.mod
+
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b  # v8.1.0
 
       - name: System packages
         run: |
@@ -123,7 +148,7 @@ jobs:
 
       - name: Start Ollama
         run: |
-          docker run -d --name ollama -p 11434:11434 ollama/ollama:latest
+          docker run -d --name ollama -p 11434:11434 "$OLLAMA_IMAGE"
           # Daemon binds the port before the model index is ready; poll until /api/tags answers.
           for _ in $(seq 1 30); do
             if curl -sf http://localhost:11434/api/tags >/dev/null; then break; fi
@@ -132,7 +157,7 @@ jobs:
           docker exec ollama ollama pull "$OLLAMA_MODEL"
 
       - name: Install frappe-bench
-        run: pip install frappe-bench
+        run: pip install "frappe-bench==5.31.0"
 
       - name: bench init (Frappe ${{ env.FRAPPE_BRANCH }})
         run: |
@@ -153,7 +178,7 @@ jobs:
       - name: Install frappe_ai (provides AI Chat Session / AI Chat Message DocTypes)
         working-directory: frappe-bench
         run: |
-          bench get-app --skip-assets "https://github.com/${FRAPPE_AI_REPO}.git"
+          bench get-app --skip-assets --branch "$FRAPPE_AI_REF" "https://github.com/${FRAPPE_AI_REPO}.git"
 
       - name: Create test site + install frappe_ai
         working-directory: frappe-bench
@@ -188,10 +213,8 @@ jobs:
           echo "frappe failed to start"; tail -200 ../frappe.log; exit 1
 
       - name: Build frappe-mcp-server
-        run: |
-          git clone --depth=1 "https://github.com/${MCP_REPO}.git" mcp-src
-          cd mcp-src
-          go build -o ../mcp-server ./
+        working-directory: mcp-src
+        run: go build -o ../mcp-server ./
 
       - name: Generate MCP config
         run: |
@@ -200,7 +223,6 @@ jobs:
             host: "0.0.0.0"
             port: 8080
             timeout: "30s"
-            max_connections: 100
           erpnext:
             base_url: "http://localhost:8000"
             api_key: "dummy"
@@ -215,7 +237,6 @@ jobs:
               validate_remote: false
           logging:
             level: "info"
-            format: "json"
           YAML
 
       - name: Start frappe-mcp-server (background)
@@ -234,16 +255,16 @@ jobs:
           echo "mcp failed to start"; tail -200 mcp.log; exit 1
 
       - name: Install agent deps
-        run: uv sync --all-extras
+        run: uv sync --locked --all-extras
 
-      - name: Run integration tests
+      - name: Run integration tests (make test-integration, with the addresses it needs)
         env:
           AI_AGENT_INTEGRATION_LLM_BASE_URL: http://localhost:11434
           AI_AGENT_INTEGRATION_LLM_MODEL: ${{ env.OLLAMA_MODEL }}
           AI_AGENT_INTEGRATION_MCP_URL: http://localhost:8080/mcp
           AI_AGENT_INTEGRATION_FRAPPE_URL: http://localhost:8000
           AI_AGENT_INTEGRATION_FRAPPE_ADMIN_PASSWORD: admin
-        run: uv run pytest tests/integration/ -m integration -v
+        run: make test-integration
 
       - name: Dump service logs on failure
         if: failure()
@@ -254,22 +275,31 @@ jobs:
 
   security:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v6
-      - uses: semgrep/semgrep-action@v1
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
         with:
-          config: auto
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b  # v8.1.0
+      - run: uv sync --locked --all-extras
+      - run: make security
+      - run: make workflows
 
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # without this the push runs beside the checks, so `latest` ships whatever they report
+    needs: [lint, typecheck, test, integration, security]
     permissions:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+        with:
+          persist-credentials: false
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -277,7 +307,7 @@ jobs:
 
       - name: Extract metadata (tags, labels) for Docker
         id: meta
-        uses: docker/metadata-action@v6
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302  # v6.2.0
         with:
           images: ghcr.io/vyogotech/frappe-ai-agent
           tags: |
@@ -286,7 +316,7 @@ jobs:
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
 
       - name: Build and push Docker image
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7.4.0
         with:
           context: .
           push: ${{ github.event_name != 'pull_request' }}

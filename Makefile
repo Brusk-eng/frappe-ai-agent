@@ -1,19 +1,42 @@
-.PHONY: install test lint format typecheck serve clean audit audit-clean
+.PHONY: install test test-integration lint format typecheck boundaries security workflows serve clean contract audit audit-clean
 
 install:
 	uv sync --all-extras
 
+# ci.yml calls these targets; spelling a command out there again is how the two drifted apart
 test:
-	uv run pytest -v
+	uv run pytest tests/unit/ -v --cov=ai_agent --cov-report=xml
+
+test-integration:
+	uv run pytest tests/integration/ -m integration -v
 
 lint:
 	uv run ruff check src/ tests/
+	uv run ruff format --check src/ tests/
 
 format:
 	uv run ruff format src/ tests/
 
 typecheck:
-	uv run pyright src/
+	uv run pyright
+
+boundaries:
+	uv run lint-imports
+
+# pip-audit reads the synced environment: `-r` makes it build a venv of its own, which
+# ensurepip cannot always create. `uv sync --locked` first, so what it reads is the lock.
+security:
+	uvx semgrep scan --metrics=off --error --config p/python src
+	uvx bandit -q -r -ll src
+	uv run --with pip-audit pip-audit --progress-spinner off --skip-editable
+
+workflows:
+	uvx zizmor --offline .github/workflows
+
+# The published wire contract. frappe_ai and Metis keep their own copies of the envelope and
+# check them against this file, so it is regenerated here and never edited by hand (ADR-004).
+contract:
+	uv run python -c 'import json, pathlib; from ai_agent.transport.sse_events import contract_schema; pathlib.Path("contract/sse-event.schema.json").write_text(json.dumps(contract_schema(), indent=2, sort_keys=True) + chr(10))'
 
 serve:
 	uv run uvicorn ai_agent.app:create_app --factory --host 0.0.0.0 --port 8484 --reload
