@@ -98,7 +98,7 @@ def test_extract_user_context_with_site():
 
 @pytest.mark.asyncio
 async def test_require_sid_resolves_tenant_url():
-    settings = Settings(_env_file=None, frappe_url="http://bench-default:8000")
+    settings = Settings(_env_file=None, frappe_url="http://bench-default:8000")  # pyright: ignore[reportCallIssue]
     resolver = SiteResolver(
         default_url="http://bench-default:8000",
         url_template="http://{site}.local:8000",
@@ -154,7 +154,7 @@ async def test_require_sid_unknown_site_yields_400(tmp_path):
     routes_file = tmp_path / "routes.yaml"
     routes_file.write_text("routes:\n  tenant-1.local: http://bench-01:8000\n")
 
-    settings = Settings(_env_file=None, frappe_url="http://bench-sentinel.invalid:8000")
+    settings = Settings(_env_file=None, frappe_url="http://bench-sentinel.invalid:8000")  # pyright: ignore[reportCallIssue]
     resolver = SiteResolver(
         default_url="http://bench-sentinel.invalid:8000",
         routes_file=str(routes_file),
@@ -190,7 +190,7 @@ async def test_require_sid_missing_site_with_routes_configured_yields_400(tmp_pa
     routes_file = tmp_path / "routes.yaml"
     routes_file.write_text("routes:\n  tenant-1.local: http://bench-01:8000\n")
 
-    settings = Settings(_env_file=None, frappe_url="http://bench-sentinel.invalid:8000")
+    settings = Settings(_env_file=None, frappe_url="http://bench-sentinel.invalid:8000")  # pyright: ignore[reportCallIssue]
     resolver = SiteResolver(
         default_url="http://bench-sentinel.invalid:8000",
         routes_file=str(routes_file),
@@ -227,7 +227,7 @@ async def test_chat_service_streamed_turn_binds_site_contextvar():
 
     from ai_agent.services.chat import ChatService
 
-    settings = Settings(_env_file=None, frappe_url="http://bench:8000")
+    settings = Settings(_env_file=None, frappe_url="http://bench:8000")  # pyright: ignore[reportCallIssue]
     mock_llm = MagicMock()
     mock_history = AsyncMock()
     mock_history.chat_doctypes_exist = AsyncMock(return_value=True)
