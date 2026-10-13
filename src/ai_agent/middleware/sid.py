@@ -3,15 +3,22 @@
 
 from __future__ import annotations
 
+import urllib.parse
 from dataclasses import dataclass
 
 import httpx
 from fastapi import HTTPException
 from starlette.requests import Request
 
-from ai_agent.integrations.frappe_routes import validate_url
 from ai_agent.middleware.site import UnknownSite
 from ai_agent.observability import request_id as correlation
+
+
+def _validate_url(url: str, name: str = "url") -> str:
+    parsed = urllib.parse.urlsplit(url.strip())
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise ValueError(f"{name} must be a valid http or https URL: {url}")
+    return url.strip().rstrip("/")
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,7 +83,7 @@ async def require_sid(request: Request) -> UserContext:
         if resolver:
             frappe_url = resolver.resolve(user_context.site, bench_url=user_context.bench_url)
         elif user_context.bench_url:
-            frappe_url = validate_url(user_context.bench_url, "X-Frappe-Bench-URL")
+            frappe_url = _validate_url(user_context.bench_url, "X-Frappe-Bench-URL")
         else:
             frappe_url = request.app.state.settings.frappe_url
     except (UnknownSite, ValueError) as exc:
