@@ -20,6 +20,7 @@ dependencies = [
     "langchain>=0.3",
     "langchain-core>=1",
     "langchain-ollama>=0.3",
+    "langchain-openai>=0.3",
     "langchain-mcp-adapters>=0.1",
     "structlog>=24.1",
     "opentelemetry-api>=1.27",
