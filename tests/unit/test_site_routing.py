@@ -1,6 +1,7 @@
 """Unit tests for multi-tenant site resolution, middleware, and session auth."""
 
 import time
+from typing import Any, cast
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -17,7 +18,6 @@ from ai_agent.middleware.site import (
     current,
     current_bench_url,
     frappe_header,
-    set_current_bench_url,
 )
 
 
@@ -282,9 +282,15 @@ def test_site_resolver_bench_url_override(tmp_path):
         routes_file=str(routes_file),
     )
     # When bench_url is provided, it overrides routes file mapping
-    assert resolver.resolve("tenant-1.local", bench_url="http://override-bench:8000") == "http://override-bench:8000"
+    assert (
+        resolver.resolve("tenant-1.local", bench_url="http://override-bench:8000")
+        == "http://override-bench:8000"
+    )
     # When bench_url is provided for an unknown site, it resolves without error
-    assert resolver.resolve("unknown.local", bench_url="http://dynamic-bench:8000") == "http://dynamic-bench:8000"
+    assert (
+        resolver.resolve("unknown.local", bench_url="http://dynamic-bench:8000")
+        == "http://dynamic-bench:8000"
+    )
     # When bench_url is invalid, ValueError is raised
     with pytest.raises(ValueError, match="URL must be an absolute http"):
         resolver.resolve("tenant-1.local", bench_url="not-a-valid-url")
@@ -416,15 +422,17 @@ def test_build_mcp_client_forwards_bench_url():
         site_name="tenant.local",
         bench_url="http://bench-target:8000",
     )
-    headers = client.connections["frappe"]["headers"]
-    assert headers["Cookie"] == "sid=session-xyz"
-    assert headers["X-Frappe-Site-Name"] == "tenant.local"
-    assert headers["X-Frappe-Bench-URL"] == "http://bench-target:8000"
+    conn = cast(dict[str, Any], client.connections["frappe"])
+    headers = conn.get("headers") or {}
+    assert headers.get("Cookie") == "sid=session-xyz"
+    assert headers.get("X-Frappe-Site-Name") == "tenant.local"
+    assert headers.get("X-Frappe-Bench-URL") == "http://bench-target:8000"
 
 
 @pytest.mark.asyncio
 async def test_chat_service_streamed_turn_binds_bench_url_contextvar():
     from unittest.mock import MagicMock
+
     from ai_agent.services.chat import ChatService
 
     settings = Settings(_env_file=None, frappe_url="http://bench:8000")  # pyright: ignore[reportCallIssue]
@@ -453,6 +461,7 @@ async def test_chat_service_streamed_turn_binds_bench_url_contextvar():
 
     with patch.object(service, "_load_tools", side_effect=fake_load_tools):
         with patch("ai_agent.services.chat.run_agent_loop") as mock_loop:
+
             async def fake_loop(**kwargs):
                 captured_bench_urls.append(current_bench_url())
                 yield {"type": "content", "text": "hello"}
@@ -470,4 +479,3 @@ async def test_chat_service_streamed_turn_binds_bench_url_contextvar():
     assert captured_bench_urls == ["http://dynamic-bench:8000"]
     assert captured_load_tools_kwargs.get("bench_url") == "http://dynamic-bench:8000"
     assert current_bench_url() is None
-
