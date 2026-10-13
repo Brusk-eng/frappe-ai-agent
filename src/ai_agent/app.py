@@ -15,8 +15,10 @@ from slowapi.util import get_remote_address
 
 from ai_agent.agent.prompts import build_system_prompt
 from ai_agent.config import Settings
+from ai_agent.integrations.frappe_routes import SiteResolver
 from ai_agent.integrations.llm import create_llm
 from ai_agent.middleware.request_id import RequestIDMiddleware
+from ai_agent.middleware.site import SiteMiddleware
 from ai_agent.observability.logging import setup_logging
 from ai_agent.observability.tracing import create_tracer_provider
 from ai_agent.services.chat import ChatService
@@ -32,11 +34,13 @@ def _sid_or_ip_key(request: Request) -> str:
     # slowapi rate-limit key — return value is never rendered to a client,
     # so semgrep's Flask directly-returned-format-string rule (which fires
     # below) is a false positive. nosem suppressions kept on the same lines.
+    site_header = request.headers.get("X-Frappe-Site-Name")
+    site_prefix = f"{site_header.strip()}:" if site_header and site_header.strip() else ""
     sid = request.cookies.get("sid")
     if sid and sid.strip():
         # slowapi logs this key on every 429, so it must not be the credential itself
-        return "sid:" + hashlib.sha256(sid.encode()).hexdigest()  # nosem
-    return "ip:" + get_remote_address(request)  # nosem
+        return f"{site_prefix}sid:" + hashlib.sha256(sid.encode()).hexdigest()  # nosem
+    return f"{site_prefix}ip:" + get_remote_address(request)  # nosem
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -91,7 +95,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.limiter = limiter
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)  # type: ignore[arg-type]
 
+    # Multi-tenant site resolver
+    site_resolver = SiteResolver(
+        default_url=settings.frappe_url,
+        routes_file=settings.frappe_site_routes_file,
+        url_template=settings.frappe_site_url_template,
+    )
+
     # Middleware. No CORS layer: every caller is server to server (ADR-023).
+    app.add_middleware(SiteMiddleware)
     app.add_middleware(RequestIDMiddleware)
 
     # Routers
@@ -108,5 +120,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # Stored for access in tests/extensions
     app.state.settings = settings
     app.state.chat_service = chat_service
+    app.state.site_resolver = site_resolver
 
     return app

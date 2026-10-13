@@ -57,26 +57,27 @@ def _with_blocks(text: str, tool_result_json: Any) -> str:
     return f"{text}\n\n{shown}" if text else shown
 
 
-def _headers(sid: str) -> dict[str, str]:
+def _headers(sid: str, site: str | None = None) -> dict[str, str]:
     """Who the call is for, and which answer it belongs to (ADR-008)."""
-    return {"Cookie": f"sid={sid}", **correlation.frappe_header()}
+    headers = {"Cookie": f"sid={sid}", **correlation.frappe_header()}
+    if site:
+        headers["X-Frappe-Site-Name"] = site
+    return headers
 
 
 class FrappeHistoryClient:
     def __init__(self, base_url: str, timeout: float = _DEFAULT_TIMEOUT):
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout
-        # Per-sid CSRF token cache. Frappe rotates tokens on re-login; we
+        # Per (site, sid) CSRF token cache. Frappe rotates tokens on re-login; we
         # invalidate an entry whenever a write fails with a CSRF error so
         # the next call picks up the fresh one.
         self._csrf_cache: dict[str, str] = {}
         # One pooled client per instance, made lazily so a process that never writes opens no pool.
         self._client: httpx.AsyncClient | None = None
         self._closed = False
-        # Whether this site has the chat doctypes at all; None until it has been asked.
-        # ponytail: one agent process serves one site, and a site gains an app only through a
-        # bench install, so this is asked once and a later install needs a restart to be seen.
-        self._doctypes_exist: bool | None = None
+        # Whether each site has the chat doctypes at all; keyed by site name.
+        self._doctypes_exist: dict[str | None, bool] = {}
 
     def _get_client(self) -> httpx.AsyncClient:
         # Raise, not rebuild: a new client here would leak, since aclose() returns once closed.
@@ -108,15 +109,20 @@ class FrappeHistoryClient:
         sid: str,
         title: str,
         context_json: str,
+        site: str | None = None,
+        base_url: str | None = None,
     ) -> str | None:
         """Create an AI Chat Session, named here as autoname is "prompt"; None on any failure."""
-        url = f"{self._base_url}{_SESSION_URL_PATH}"
+        effective_base = (base_url or self._base_url).rstrip("/")
+        url = f"{effective_base}{_SESSION_URL_PATH}"
         payload = {
             "name": f"chat-{uuid4().hex}",
             "title": title,
             "context_json": context_json,
         }
-        return await self._post_and_extract_name(url, payload, sid, "session")
+        return await self._post_and_extract_name(
+            url, payload, sid, "session", site=site, base_url=base_url
+        )
 
     async def ensure_session(
         self,
@@ -125,11 +131,16 @@ class FrappeHistoryClient:
         name: str,
         title: str,
         context_json: str,
+        site: str | None = None,
+        base_url: str | None = None,
     ) -> str | None:
         """Ensure session `name` exists: a message's Link check fails without its row."""
-        url = f"{self._base_url}{_SESSION_URL_PATH}"
+        effective_base = (base_url or self._base_url).rstrip("/")
+        url = f"{effective_base}{_SESSION_URL_PATH}"
         payload = {"name": name, "title": title, "context_json": context_json}
-        result = await self._post_and_extract_name(url, payload, sid, "session")
+        result = await self._post_and_extract_name(
+            url, payload, sid, "session", site=site, base_url=base_url
+        )
         # If creation returned the name, great. Otherwise assume it failed
         # because the row already exists (idempotent) — return the supplied
         # name so the caller can keep using it.
@@ -145,9 +156,12 @@ class FrappeHistoryClient:
         tool_name: str | None = None,
         tool_args_json: str | None = None,
         tool_result_json: str | None = None,
+        site: str | None = None,
+        base_url: str | None = None,
     ) -> str | None:
         """Create an AI Chat Message linked to the given session; None on any failure."""
-        url = f"{self._base_url}{_MESSAGE_URL_PATH}"
+        effective_base = (base_url or self._base_url).rstrip("/")
+        url = f"{effective_base}{_MESSAGE_URL_PATH}"
         payload: dict[str, Any] = {
             "session": session,
             "role": role,
@@ -159,7 +173,9 @@ class FrappeHistoryClient:
             payload["tool_args_json"] = tool_args_json
         if tool_result_json is not None:
             payload["tool_result_json"] = tool_result_json
-        return await self._post_and_extract_name(url, payload, sid, "message")
+        return await self._post_and_extract_name(
+            url, payload, sid, "message", site=site, base_url=base_url
+        )
 
     async def list_messages(
         self,
@@ -167,9 +183,12 @@ class FrappeHistoryClient:
         sid: str,
         session: str,
         limit: int = 20,
+        site: str | None = None,
+        base_url: str | None = None,
     ) -> list[dict[str, str]]:
         """The last `limit` messages of `session`, oldest first; [] on a Frappe or parse failure."""
-        url = f"{self._base_url}/api/method/frappe.client.get_list"
+        effective_base = (base_url or self._base_url).rstrip("/")
+        url = f"{effective_base}/api/method/frappe.client.get_list"
         params = {
             "doctype": "AI Chat Message",
             "fields": json.dumps(["role", "content", "tool_result_json"]),
@@ -179,12 +198,13 @@ class FrappeHistoryClient:
         }
         try:
             client = self._get_client()
-            resp = await client.get(url, params=params, headers=_headers(sid))
+            resp = await client.get(url, params=params, headers=_headers(sid, site))
             if resp.status_code != 200:
                 logger.warning(
                     "chat_history_list_failed",
                     session=session,
                     status_code=resp.status_code,
+                    site=site,
                 )
                 return []
             data = resp.json().get("message") or []
@@ -205,29 +225,42 @@ class FrappeHistoryClient:
                 session=session,
                 error_type=type(exc).__name__,
                 error=str(exc)[:200],
+                site=site,
             )
             return []
 
-    async def chat_doctypes_exist(self, sid: str) -> bool:
+    async def chat_doctypes_exist(
+        self,
+        sid: str,
+        site: str | None = None,
+        base_url: str | None = None,
+    ) -> bool:
         """Whether frappe_ai, which defines both chat doctypes, is on this site; asked once."""
         # asked of get_versions, not of the doctypes: reading a doctype the site has not got is
         # 404 only for a System Manager and 403 for everyone else, because frappe's own
         # handle_does_not_exist_error re-dispatches it as the PermissionError on DocType
-        if self._doctypes_exist is None:
-            self._doctypes_exist = await self._the_app_is_installed(sid)
-            if not self._doctypes_exist:
-                logger.warning("frappe_history_off_app_not_installed", app=_HISTORY_APP)
-        return self._doctypes_exist
+        if site not in self._doctypes_exist:
+            exists = await self._the_app_is_installed(sid, site=site, base_url=base_url)
+            self._doctypes_exist[site] = exists
+            if not exists:
+                logger.warning("frappe_history_off_app_not_installed", app=_HISTORY_APP, site=site)
+        return self._doctypes_exist[site]
 
     # ---------------------------------------------------------------- #
     # internals
     # ---------------------------------------------------------------- #
 
-    async def _the_app_is_installed(self, sid: str) -> bool:
+    async def _the_app_is_installed(
+        self,
+        sid: str,
+        site: str | None = None,
+        base_url: str | None = None,
+    ) -> bool:
         """True unless frappe names the site's active apps and frappe_ai is not among them."""
+        effective_base = (base_url or self._base_url).rstrip("/")
         try:
             response = await self._get_client().get(
-                f"{self._base_url}{_VERSIONS_URL_PATH}", headers=_headers(sid)
+                f"{effective_base}{_VERSIONS_URL_PATH}", headers=_headers(sid, site)
             )
             if response.status_code != 200:
                 return True  # an outage or a refusal is not an answer; write as before
@@ -237,25 +270,32 @@ class FrappeHistoryClient:
                 "frappe_history_app_check_failed",
                 error_type=type(exc).__name__,
                 error=str(exc)[:200],
+                site=site,
             )
             return True
 
-    async def _fetch_csrf_token(self, sid: str) -> str | None:
+    async def _fetch_csrf_token(
+        self,
+        sid: str,
+        site: str | None = None,
+        base_url: str | None = None,
+    ) -> str | None:
         """The CSRF token inlined in the desk page (Frappe sends no header); None on any failure."""
-        url = f"{self._base_url}{_CSRF_URL_PATH}"
+        effective_base = (base_url or self._base_url).rstrip("/")
+        url = f"{effective_base}{_CSRF_URL_PATH}"
         # Same closed-check positioning as _post_and_extract_name:
         # outside the try so use-after-close raises cleanly.
         client = self._get_client()
         try:
             # httpx rebuilds a redirect's cookies from the jar, which keeps none, so each hop
             # (Frappe 16 sends /app on to /desk) is followed here with the sid
-            response = await client.get(url, headers=_headers(sid), follow_redirects=False)
+            response = await client.get(url, headers=_headers(sid, site), follow_redirects=False)
             for _ in range(4):  # five requests in all
                 if response.next_request is None:
                     break
                 response = await client.get(
                     str(response.next_request.url),
-                    headers=_headers(sid),
+                    headers=_headers(sid, site),
                     follow_redirects=False,
                 )
             response.raise_for_status()
@@ -265,17 +305,16 @@ class FrappeHistoryClient:
                     "frappe_history_csrf_fetch_unauthenticated",
                     final_url=str(response.url),
                     hint="sid invalid/expired; subsequent writes will 403",
+                    site=site,
                 )
                 return None
             match = _CSRF_PATTERN.search(response.text)
             if match is None:
-                # Should be rare now that the redirect case is caught above
-                # — surface enough detail to diagnose (response size + a
-                # short slice) without dumping the whole 400KB desk HTML.
                 logger.warning(
                     "frappe csrf token not found in /app response",
                     response_size=len(response.text),
                     response_head=response.text[:200],
+                    site=site,
                 )
                 return None
             return match.group(1)
@@ -284,22 +323,30 @@ class FrappeHistoryClient:
                 "frappe_history_csrf_fetch_failed",
                 error_type=type(exc).__name__,
                 error=str(exc),
+                site=site,
             )
             return None
 
-    async def _csrf_token_for(self, sid: str) -> str | None:
-        cached = self._csrf_cache.get(sid)
+    async def _csrf_token_for(
+        self,
+        sid: str,
+        site: str | None = None,
+        base_url: str | None = None,
+    ) -> str | None:
+        key = f"{site}:{sid}" if site else sid
+        cached = self._csrf_cache.get(key)
         if cached:
             return cached
-        fresh = await self._fetch_csrf_token(sid)
+        fresh = await self._fetch_csrf_token(sid, site=site, base_url=base_url)
         if fresh:
             while len(self._csrf_cache) >= _CSRF_CACHE_MAX:
                 del self._csrf_cache[next(iter(self._csrf_cache))]
-            self._csrf_cache[sid] = fresh
+            self._csrf_cache[key] = fresh
         return fresh
 
-    def _invalidate_csrf(self, sid: str) -> None:
-        self._csrf_cache.pop(sid, None)
+    def _invalidate_csrf(self, sid: str, site: str | None = None) -> None:
+        key = f"{site}:{sid}" if site else sid
+        self._csrf_cache.pop(key, None)
 
     async def _post_and_extract_name(
         self,
@@ -307,36 +354,42 @@ class FrappeHistoryClient:
         payload: dict[str, Any],
         sid: str,
         kind: str,
+        site: str | None = None,
+        base_url: str | None = None,
     ) -> str | None:
         # Outside the try, which swallows Frappe outages: use-after-close must raise.
         client = self._get_client()
-        if self._doctypes_exist is False:
+        if self._doctypes_exist.get(site) is False:
             return None
 
         with _tracer.start_as_current_span("agent.history.write") as span:
             span.set_attribute("kind", kind)
+            if site:
+                span.set_attribute("site", site)
 
             try:
-                csrf_token = await self._csrf_token_for(sid)
-                headers = _headers(sid)
+                csrf_token = await self._csrf_token_for(sid, site=site, base_url=base_url)
+                headers = _headers(sid, site)
                 if csrf_token:
                     headers[_CSRF_HEADER] = csrf_token
                 response = await client.post(url, json=payload, headers=headers)
 
                 if response.status_code == 400 and _looks_like_csrf_error(response):
                     # Token probably rotated. Clear cache, refetch, try once.
-                    logger.info("frappe_history_csrf_token_rejected_refreshing", kind=kind)
-                    self._invalidate_csrf(sid)
-                    fresh = await self._csrf_token_for(sid)
+                    logger.info(
+                        "frappe_history_csrf_token_rejected_refreshing", kind=kind, site=site
+                    )
+                    self._invalidate_csrf(sid, site=site)
+                    fresh = await self._csrf_token_for(sid, site=site, base_url=base_url)
                     if fresh:
                         headers[_CSRF_HEADER] = fresh
                         response = await client.post(url, json=payload, headers=headers)
 
                 if response.status_code == 500 and _names_a_missing_controller(response):
                     # a caller that brings its own session id writes before it is ever asked
-                    if self._doctypes_exist is not False:
-                        logger.warning("frappe_history_off_no_chat_doctypes", kind=kind)
-                    self._doctypes_exist = False
+                    if self._doctypes_exist.get(site) is not False:
+                        logger.warning("frappe_history_off_no_chat_doctypes", kind=kind, site=site)
+                    self._doctypes_exist[site] = False
                     span.set_attribute("history_off", True)
                     return None
 
@@ -347,6 +400,7 @@ class FrappeHistoryClient:
                         "frappe_history_session_already_exists",
                         kind=kind,
                         name=payload["name"],
+                        site=site,
                     )
                     span.set_attribute("status_code", response.status_code)
                     span.set_attribute("idempotent", True)
@@ -365,6 +419,7 @@ class FrappeHistoryClient:
                     error_type=type(exc).__name__,
                     error=str(exc),
                     status_code=status_code,
+                    site=site,
                 )
                 _history_write_failures.add(1, {"kind": kind})
                 span.set_attribute("failed", True)

@@ -83,8 +83,29 @@ class Settings(BaseSettings):
     # dependency answers ok: False inside the 5 s rag allows the call (rag/rag/status.py).
     health_probe_timeout_s: float = 2.0
 
-    # Frappe URL for chat history persistence
+    # Frappe URL and multi-tenant routing for chat history and session validation
     frappe_url: str = "http://localhost:8000"
+    frappe_site_routes_file: str = ""
+    frappe_site_url_template: str = ""
+
+    @field_validator("frappe_site_routes_file")
+    @classmethod
+    def _validate_routes_file(cls, v: str) -> str:
+        if not v:
+            return v
+        path = Path(v)
+        if not path.is_file():
+            raise ValueError(f"frappe_site_routes_file does not exist or is not a file: {v}")
+        return v
+
+    @field_validator("frappe_site_url_template")
+    @classmethod
+    def _validate_url_template(cls, v: str) -> str:
+        if not v:
+            return v
+        if "{site}" not in v:
+            raise ValueError("frappe_site_url_template must contain '{site}' placeholder")
+        return v
 
     # Observability
     otel_endpoint: str = ""

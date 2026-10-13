@@ -32,6 +32,7 @@ from ai_agent.config import Settings
 from ai_agent.integrations.frappe_history import FrappeHistoryClient
 from ai_agent.integrations.mcp import build_mcp_client_for_sid, filter_deprecated
 from ai_agent.middleware.sid import UserContext
+from ai_agent.middleware.site import set_current
 
 logger = structlog.get_logger(__name__)
 _tracer = trace.get_tracer(__name__)
@@ -299,34 +300,63 @@ class ChatService:
         await self._history.aclose()
 
     async def _open_session(
-        self, *, sid: str, session_id: str | None, title: str, context: dict[str, Any]
+        self,
+        *,
+        sid: str,
+        session_id: str | None,
+        title: str,
+        context: dict[str, Any],
+        site: str | None = None,
+        base_url: str | None = None,
     ) -> tuple[str, bool]:
         """The session row this turn writes to, and whether Frappe took it."""
         context_json = json.dumps(context or {})
         if session_id is not None:
             # save_message 417s until this row exists; a duplicate create is a no-op.
             await self._history.ensure_session(
-                sid=sid, name=session_id, title=_derive_title(title), context_json=context_json
+                sid=sid,
+                name=session_id,
+                title=_derive_title(title),
+                context_json=context_json,
+                site=site,
+                base_url=base_url,
             )
             return session_id, True
         # asked on the read route before the turn's first write: a site without the chat doctypes
         # answers a write with a 500 and an Error Log row of its own for each one
-        if not await self._history.chat_doctypes_exist(sid):
+        if not await self._history.chat_doctypes_exist(sid, site=site, base_url=base_url):
             return f"tmp-{uuid4().hex[:8]}", False
         created = await self._history.create_session(
-            sid=sid, title=_derive_title(title), context_json=context_json
+            sid=sid,
+            title=_derive_title(title),
+            context_json=context_json,
+            site=site,
+            base_url=base_url,
         )
         if created is not None:
             return created, True
         temporary = f"tmp-{uuid4().hex[:8]}"
-        logger.warning("chat_history_session_create_failed_using_tmp", session_id=temporary)
+        logger.warning(
+            "chat_history_session_create_failed_using_tmp",
+            session_id=temporary,
+            site=site,
+        )
         return temporary, False
 
-    async def _history_messages(self, *, sid: str, session_id: str) -> list[BaseMessage]:
+    async def _history_messages(
+        self,
+        *,
+        sid: str,
+        session_id: str,
+        site: str | None = None,
+        base_url: str | None = None,
+    ) -> list[BaseMessage]:
         """The session's earlier turns as prompt messages, each capped to what a prompt may hold."""
         if not session_id or session_id.startswith("tmp-"):
             return []
-        rows = await self._history.list_messages(sid=sid, session=session_id, limit=20)
+        rows = await self._history.list_messages(
+            sid=sid, session=session_id, limit=20, site=site, base_url=base_url
+        )
         limit = self._settings.agent_prompt_text_max_chars
         return [
             HumanMessage(content=cap_for_prompt(row["content"], limit))
@@ -336,12 +366,20 @@ class ChatService:
         ]
 
     async def _load_tools(
-        self, *, sid: str, session_id: str, confirmation: dict[str, Any] | None
+        self,
+        *,
+        sid: str,
+        session_id: str,
+        confirmation: dict[str, Any] | None,
+        site_name: str | None = None,
     ) -> tuple[list[Any], str | None]:
         """The caller's tools, or none of them and the line telling the model why it has none."""
         # Per-request MCP client carrying the caller's sid cookie.
         mcp_client = build_mcp_client_for_sid(
-            self._settings, sid, confirmation["token"] if confirmation else None
+            self._settings,
+            sid,
+            confirmation["token"] if confirmation else None,
+            site_name=site_name,
         )
         tools: list[Any] = []
         unavailable_reason: str | None = None
@@ -469,6 +507,8 @@ class ChatService:
                     content=content,
                     tool_args_json=tool_args_json,
                     tool_result_json=tool_result_json,
+                    site=user_context.site,
+                    base_url=user_context.frappe_base_url,
                 )
             except RuntimeError as exc:
                 logger.warning(
@@ -481,141 +521,164 @@ class ChatService:
                 degraded = True
 
         turn: dict[str, Any] = {"session_id": session_id, "t0": t0}
-        with (
-            _tracer.start_as_current_span("agent.chat_turn") as turn_span,
-            _log_when_cancelled(turn, events.tools_called, events.text_parts),
-        ):
-            try:
-                session_id, session_saved = await self._open_session(
-                    sid=user_context.sid,
-                    session_id=session_id,
-                    title=user_message,
-                    context=context,
-                )
-                if not session_saved:
-                    degraded = True
-
-                turn_span.set_attribute("session_id", session_id)
-                turn["session_id"] = session_id
-
-                # The frontend sends this id back; without it every message opens a new session.
-                yield {"type": "session", "id": session_id}
-
-                # Read before the question is saved, so the history holds only earlier turns.
-                history_messages = await self._history_messages(
-                    sid=user_context.sid, session_id=session_id
-                )
-
-                # A confirmed turn has no message of the user's, and saving the agent's
-                # stand-in line would replay it as one next turn.
-                if confirmation is None and (
-                    await self._history.save_message(
+        if user_context.site:
+            turn["site"] = user_context.site
+            set_current(user_context.site)
+            structlog.contextvars.bind_contextvars(site=user_context.site)
+        try:
+            with (
+                _tracer.start_as_current_span("agent.chat_turn") as turn_span,
+                _log_when_cancelled(turn, events.tools_called, events.text_parts),
+            ):
+                try:
+                    if user_context.site:
+                        turn_span.set_attribute("site", user_context.site)
+                    session_id, session_saved = await self._open_session(
                         sid=user_context.sid,
-                        session=session_id,
-                        role="user",
-                        content=user_message,
+                        session_id=session_id,
+                        title=user_message,
+                        context=context,
+                        site=user_context.site,
+                        base_url=user_context.frappe_base_url,
                     )
-                    is None
-                ):
-                    degraded = True
+                    if not session_saved:
+                        degraded = True
 
-                tools, tools_unavailable_reason = await self._load_tools(
-                    sid=user_context.sid, session_id=session_id, confirmation=confirmation
-                )
-                context_preamble = self._system_prompt(context, tools_unavailable_reason)
-                tool_registry = ToolRegistry(tools, self._settings.mcp_tool_timeout_s)
-                tool_invocations = tool_registry.invocations
+                    turn_span.set_attribute("session_id", session_id)
+                    turn["session_id"] = session_id
 
-                # A step is one LLM call plus its tool calls: two units of the recursion limit.
-                max_steps = max(1, self._settings.agent_recursion_limit // 2)
-                with _tracer.start_as_current_span("agent.run") as run_span:
-                    run_span.set_attribute("tool_count", len(tool_registry))
-                    run_span.set_attribute("max_steps", max_steps)
-                    run_span.set_attribute("history_turns", len(history_messages))
-                    async for ev in _until(
-                        deadline,
-                        run_agent_loop(
-                            llm=self._llm,
-                            tool_registry=tool_registry,
-                            user_message=user_message,
-                            context_preamble=context_preamble,
-                            history=history_messages or None,
-                            max_steps=max_steps,
-                            tool_result_max_chars=self._settings.agent_prompt_text_max_chars,
-                            callbacks=[decode],
+                    # The frontend sends this id back; without it every message opens a new session.
+                    yield {"type": "session", "id": session_id}
+
+                    # Read before the question is saved, so the history holds only earlier turns.
+                    history_messages = await self._history_messages(
+                        sid=user_context.sid,
+                        session_id=session_id,
+                        site=user_context.site,
+                        base_url=user_context.frappe_base_url,
+                    )
+
+                    # A confirmed turn has no message of the user's, and saving the agent's
+                    # stand-in line would replay it as one next turn.
+                    if confirmation is None and (
+                        await self._history.save_message(
+                            sid=user_context.sid,
                             session=session_id,
-                            confirmed=_confirmed_call(confirmation),
-                        ),
-                    ):
-                        for out in events.observe(ev, t0=t0, session_id=session_id):
-                            yield out
-
-                    # a tool the turn asked for and did not get: the answer is not fully backed
-                    degraded = degraded or bool(_failed_calls(tool_registry.invocations))
-
-            except (asyncio.CancelledError, GeneratorExit):
-                # Stop, a dropped socket or a killed worker: the user read the text that arrived,
-                # so keep it before the cancellation finishes unwinding this turn.
-                if events.text_parts and session_id is not None:
-                    with anyio.move_on_after(_STOPPED_SAVE_TIMEOUT_S, shield=True):
-                        await save_answer(
-                            _saved_answer(events.text_parts, ANSWER_STOPPED), session_id
+                            role="user",
+                            content=user_message,
+                            site=user_context.site,
+                            base_url=user_context.frappe_base_url,
                         )
-                raise
+                        is None
+                    ):
+                        degraded = True
 
-            except Exception as exc:
-                failed = True
-                error_type = type(exc).__name__
-                display_exc = _root_cause(exc)
-                logger.exception(
-                    "chat_handle_message_failed",
+                    tools, tools_unavailable_reason = await self._load_tools(
+                        sid=user_context.sid,
+                        session_id=session_id,
+                        confirmation=confirmation,
+                        site_name=user_context.site,
+                    )
+                    context_preamble = self._system_prompt(context, tools_unavailable_reason)
+                    tool_registry = ToolRegistry(tools, self._settings.mcp_tool_timeout_s)
+                    tool_invocations = tool_registry.invocations
+
+                    # A step is one LLM call plus its tool calls: two units of the recursion limit.
+                    max_steps = max(1, self._settings.agent_recursion_limit // 2)
+                    with _tracer.start_as_current_span("agent.run") as run_span:
+                        run_span.set_attribute("tool_count", len(tool_registry))
+                        run_span.set_attribute("max_steps", max_steps)
+                        run_span.set_attribute("history_turns", len(history_messages))
+                        async for ev in _until(
+                            deadline,
+                            run_agent_loop(
+                                llm=self._llm,
+                                tool_registry=tool_registry,
+                                user_message=user_message,
+                                context_preamble=context_preamble,
+                                history=history_messages or None,
+                                max_steps=max_steps,
+                                tool_result_max_chars=self._settings.agent_prompt_text_max_chars,
+                                callbacks=[decode],
+                                session=session_id,
+                                confirmed=_confirmed_call(confirmation),
+                            ),
+                        ):
+                            for out in events.observe(ev, t0=t0, session_id=session_id):
+                                yield out
+
+                        # a tool the turn asked for and did not get: the answer is not fully backed
+                        degraded = degraded or bool(_failed_calls(tool_registry.invocations))
+
+                except (asyncio.CancelledError, GeneratorExit):
+                    # Stop, a dropped socket or a killed worker: the user read the text that
+                    # arrived, so keep it before the cancellation finishes unwinding this turn.
+                    if events.text_parts and session_id is not None:
+                        with anyio.move_on_after(_STOPPED_SAVE_TIMEOUT_S, shield=True):
+                            await save_answer(
+                                _saved_answer(events.text_parts, ANSWER_STOPPED), session_id
+                            )
+                    raise
+
+                except Exception as exc:
+                    failed = True
+                    error_type = type(exc).__name__
+                    display_exc = _root_cause(exc)
+                    logger.exception(
+                        "chat_handle_message_failed",
+                        session_id=session_id,
+                        sid_present=bool(user_context.sid),
+                        error_type=type(exc).__name__,
+                        root_cause_type=type(display_exc).__name__,
+                        error=str(display_exc)[:300],
+                        llm_provider=self._settings.llm_provider,
+                        llm_model=self._settings.llm_model,
+                        llm_base_url=self._settings.llm_base_url,
+                    )
+                    # Record on the active span so a trace UI shows ERROR
+                    # status without consulting the log. record_exception
+                    # captures the type/message/stacktrace as a span event.
+                    turn_span.record_exception(exc)
+                    turn_span.set_status(Status(StatusCode.ERROR, type(exc).__name__))
+                    # One plain line per kind of failure: only a TurnFailure carries a line written
+                    # for the user, and every other exception's type and text stay in the log above.
+                    error_message = (
+                        str(display_exc) if isinstance(display_exc, TurnFailure) else ANSWER_FAILED
+                    )
+                    yield {"type": "error", "message": error_message}
+
+                assistant_content = (
+                    _saved_answer(events.text_parts, error_message)
+                    if failed
+                    else "".join(events.text_parts)
+                )
+                if (
+                    session_id is not None
+                ):  # the session write itself is what failed; nowhere to save
+                    await save_answer(assistant_content, session_id)
+
+                # A tool failure never raises — it comes back as a result the model reads — so a
+                # turn built on one is still answered, and it is the answer that is worth less.
+                tools_failed = _failed_calls(tool_invocations)
+                yield _done_event(
+                    events.tools_called,
+                    failed=failed,
+                    degraded=degraded,
+                    usage=_usage(decode, events.first_token),
+                )
+
+                # After `done`, so a turn the client cancels is not logged as completed.
+                _log_completed(
+                    turn_span,
+                    events,
                     session_id=session_id,
-                    sid_present=bool(user_context.sid),
-                    error_type=type(exc).__name__,
-                    root_cause_type=type(display_exc).__name__,
-                    error=str(display_exc)[:300],
-                    llm_provider=self._settings.llm_provider,
-                    llm_model=self._settings.llm_model,
-                    llm_base_url=self._settings.llm_base_url,
+                    t0=t0,
+                    failed=failed,
+                    degraded=degraded,
+                    tools_failed=tools_failed,
+                    error_type=error_type,
                 )
-                # Record on the active span so a trace UI shows ERROR
-                # status without consulting the log. record_exception
-                # captures the type/message/stacktrace as a span event.
-                turn_span.record_exception(exc)
-                turn_span.set_status(Status(StatusCode.ERROR, type(exc).__name__))
-                # One plain line per kind of failure: only a TurnFailure carries a line written for
-                # the user, and every other exception's type and text stay in the log above.
-                error_message = (
-                    str(display_exc) if isinstance(display_exc, TurnFailure) else ANSWER_FAILED
-                )
-                yield {"type": "error", "message": error_message}
-
-            assistant_content = (
-                _saved_answer(events.text_parts, error_message)
-                if failed
-                else "".join(events.text_parts)
-            )
-            if session_id is not None:  # the session write itself is what failed; nowhere to save
-                await save_answer(assistant_content, session_id)
-
-            # A tool failure never raises — it comes back as a result the model reads — so a
-            # turn built on one is still answered, and it is the answer that is worth less.
-            tools_failed = _failed_calls(tool_invocations)
-            yield _done_event(
-                events.tools_called,
-                failed=failed,
-                degraded=degraded,
-                usage=_usage(decode, events.first_token),
-            )
-
-            # After `done`, so a turn the client cancels is not logged as completed.
-            _log_completed(
-                turn_span,
-                events,
-                session_id=session_id,
-                t0=t0,
-                failed=failed,
-                degraded=degraded,
-                tools_failed=tools_failed,
-                error_type=error_type,
-            )
+        finally:
+            if user_context.site:
+                set_current(None)
+                structlog.contextvars.unbind_contextvars("site")

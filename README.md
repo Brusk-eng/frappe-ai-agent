@@ -177,6 +177,8 @@ there is silent — check the resolved values on `GET /config`.
 | `AI_AGENT_MCP_TOOL_TIMEOUT_S` | `30.0` | Bound on one tool call, and on the HTTP and SSE read timeouts of the MCP session under it. A timeout comes back as a tool result the model can answer around |
 | `AI_AGENT_HEALTH_PROBE_TIMEOUT_S` | `5.0` | Timeout on the agent's own `/health` reachability pings against MCP and Ollama |
 | `AI_AGENT_FRAPPE_URL` | `http://localhost:8000` | Frappe URL for chat history writes |
+| `AI_AGENT_FRAPPE_SITE_ROUTES_FILE` | _empty_ | Optional path to YAML file mapping tenant site names to Frappe bench URLs |
+| `AI_AGENT_FRAPPE_SITE_URL_TEMPLATE` | _empty_ | Optional URL template containing `{site}` (e.g. `http://{site}.local:8000`) |
 | `AI_AGENT_OTEL_ENDPOINT` | _empty_ | OTLP gRPC endpoint. Empty = tracing disabled |
 | `AI_AGENT_OTEL_SERVICE_NAME` | `frappe-ai-agent` | Resource attribute on emitted spans |
 | `AI_AGENT_LOG_LEVEL` | `info` | `debug` / `info` / `warning` / `error` |
@@ -246,6 +248,27 @@ An answer's `tool_result_json` keeps its content blocks and, for every passage t
 Writes go through Frappe's REST API with the caller's `sid`. The client handles Frappe's HTML-embedded CSRF token: it GETs `/app`, regexes the `csrf_token = "<hex>"` JS variable, caches it per `sid`, and refreshes it once on a 400 CSRF error.
 
 History writes are **best-effort** — failures are logged but never abort the conversation. If session creation fails, the agent falls back to a `tmp-<hex>` id so the rest of the request still works (and the user just loses persistence for that turn).
+
+## Multi-tenancy
+
+One agent can serve any number of Frappe sites, on one bench or on several. A single-site install needs no extra configuration.
+
+**How a request finds its site.** The caller names the site in the `X-Frappe-Site-Name` header; `frappe_ai` sends it automatically. The agent validates the caller's `sid` against that site and nothing else, so a session from one site presented with another site's name is refused with `401`. The same site name goes on every call the agent makes for the request: the session check, chat-history reads and writes, and the MCP server. A request that names no site is handled exactly as before, against `AI_AGENT_FRAPPE_URL`.
+
+**How a site finds its bench.** The agent resolves a site's Frappe URL from its own settings, in this order, and never from the caller:
+
+1. `AI_AGENT_FRAPPE_SITE_ROUTES_FILE` — a YAML file mapping site names to bench URLs. A site missing from the file is refused with `400`, as is a request that names no site. The file is re-read when it changes, so adding a site needs no restart.
+2. `AI_AGENT_FRAPPE_SITE_URL_TEMPLATE` — a URL with a `{site}` placeholder, for platforms whose bench addresses follow a pattern.
+3. `AI_AGENT_FRAPPE_URL` — the single default.
+
+```yaml
+# site_routes.yaml
+routes:
+  tenant-a.example.com: http://bench-01:8000
+  tenant-b.example.com: http://bench-02:8000
+```
+
+**What stays separate.** Chat-history state, CSRF tokens and the per-user rate limit are all kept per site, so identically named users on two sites never share an entry. The site is attached to every log line and trace span of the turn.
 
 ## Project layout
 

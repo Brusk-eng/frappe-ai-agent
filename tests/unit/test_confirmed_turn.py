@@ -87,7 +87,7 @@ async def _run_confirmed(
 ) -> list[dict[str, Any]]:
     mcp = MagicMock(get_tools=AsyncMock(return_value=[_tool(calls)]))
 
-    def _build(settings, sid, confirmation_token=None):
+    def _build(settings, sid, confirmation_token=None, site_name=None):
         built.append((sid, confirmation_token))
         return mcp
 

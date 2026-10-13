@@ -28,7 +28,10 @@ DEPRECATED_TOOLS = frozenset(
 
 
 def build_mcp_client_for_sid(
-    settings: Settings, sid: str, confirmation_token: str | None = None
+    settings: Settings,
+    sid: str,
+    confirmation_token: str | None = None,
+    site_name: str | None = None,
 ) -> MultiServerMCPClient:
     """A new client per call, forwarding `sid`: shared, it would carry one user's sid to another.
 
@@ -42,6 +45,8 @@ def build_mcp_client_for_sid(
         headers["X-Request-ID"] = request_id
     if confirmation_token:
         headers["X-Frappe-Confirmation"] = confirmation_token
+    if site_name:
+        headers["X-Frappe-Site-Name"] = site_name
     return MultiServerMCPClient(
         {
             "frappe": {
