@@ -3,7 +3,6 @@ name: CI
 on:
   push:
     branches: [main, develop]
-    tags: ['v*']
   pull_request:
     branches: [main, develop]
   workflow_dispatch:  # enables manual run of the `integration` job below
@@ -313,7 +312,6 @@ jobs:
           images: ghcr.io/vyogotech/frappe-ai-agent
           tags: |
             type=ref,event=branch
-            type=ref,event=tag
             type=sha,format=short
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
 
