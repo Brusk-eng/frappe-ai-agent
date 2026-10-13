@@ -9,6 +9,7 @@ import httpx
 from fastapi import HTTPException
 from starlette.requests import Request
 
+from ai_agent.integrations.frappe_routes import validate_url
 from ai_agent.middleware.site import UnknownSite
 from ai_agent.observability import request_id as correlation
 
@@ -19,6 +20,7 @@ class UserContext:
 
     sid: str
     site: str | None = None
+    bench_url: str | None = None
     frappe_base_url: str = ""
 
     def __post_init__(self) -> None:
@@ -33,7 +35,9 @@ def extract_user_context(request: Request) -> UserContext | None:
         return None
     site_header = request.headers.get("X-Frappe-Site-Name")
     site = site_header.strip() if site_header and site_header.strip() else None
-    return UserContext(sid=sid, site=site)
+    bench_header = request.headers.get("X-Frappe-Bench-URL")
+    bench_url = bench_header.strip() if bench_header and bench_header.strip() else None
+    return UserContext(sid=sid, site=site, bench_url=bench_url)
 
 
 async def signed_in_user(frappe_url: str, sid: str, site: str | None = None) -> str | None:
@@ -69,12 +73,13 @@ async def require_sid(request: Request) -> UserContext:
 
     resolver = getattr(request.app.state, "site_resolver", None)
     try:
-        frappe_url = (
-            resolver.resolve(user_context.site)
-            if resolver
-            else request.app.state.settings.frappe_url
-        )
-    except UnknownSite as exc:
+        if resolver:
+            frappe_url = resolver.resolve(user_context.site, bench_url=user_context.bench_url)
+        elif user_context.bench_url:
+            frappe_url = validate_url(user_context.bench_url, "X-Frappe-Bench-URL")
+        else:
+            frappe_url = request.app.state.settings.frappe_url
+    except (UnknownSite, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     try:
@@ -83,4 +88,9 @@ async def require_sid(request: Request) -> UserContext:
         raise HTTPException(status_code=503, detail="Cannot check your session right now") from exc
     if user is None:
         raise HTTPException(status_code=401, detail="Not signed in")
-    return UserContext(sid=user_context.sid, site=user_context.site, frappe_base_url=frappe_url)
+    return UserContext(
+        sid=user_context.sid,
+        site=user_context.site,
+        bench_url=user_context.bench_url,
+        frappe_base_url=frappe_url,
+    )

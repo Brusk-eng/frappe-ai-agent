@@ -19,7 +19,9 @@ from starlette.requests import Request
 from starlette.responses import Response
 
 _FRAPPE_SITE_HEADER = "X-Frappe-Site-Name"
+_FRAPPE_BENCH_URL_HEADER = "X-Frappe-Bench-URL"
 _site_context: ContextVar[str | None] = ContextVar("site", default=None)
+_bench_url_context: ContextVar[str | None] = ContextVar("bench_url", default=None)
 
 
 class UnknownSite(Exception):
@@ -36,10 +38,26 @@ def set_current(site: str | None) -> None:
     _site_context.set(site)
 
 
+def current_bench_url() -> str | None:
+    """The bench URL bound for this request, or None outside one."""
+    return _bench_url_context.get()
+
+
+def set_current_bench_url(bench_url: str | None) -> None:
+    """Set the current bench URL."""
+    _bench_url_context.set(bench_url)
+
+
 def frappe_header() -> dict[str, str]:
-    """The header a call to Frappe carries, or nothing if no site is set."""
+    """The headers a call to Frappe carries, or nothing if neither site nor bench URL is set."""
+    headers: dict[str, str] = {}
     site = current()
-    return {_FRAPPE_SITE_HEADER: site} if site else {}
+    if site:
+        headers[_FRAPPE_SITE_HEADER] = site
+    bench_url = current_bench_url()
+    if bench_url:
+        headers[_FRAPPE_BENCH_URL_HEADER] = bench_url
+    return headers
 
 
 class SiteMiddleware(BaseHTTPMiddleware):
@@ -47,12 +65,30 @@ class SiteMiddleware(BaseHTTPMiddleware):
         site_header = request.headers.get(_FRAPPE_SITE_HEADER)
         site = site_header.strip() if site_header and site_header.strip() else None
         _site_context.set(site)
+
+        bench_header = request.headers.get(_FRAPPE_BENCH_URL_HEADER)
+        bench_url = bench_header.strip() if bench_header and bench_header.strip() else None
+        _bench_url_context.set(bench_url)
+
+        bind_vars: dict[str, str] = {}
+        unbind_vars: list[str] = []
         if site:
-            structlog.contextvars.bind_contextvars(site=site)
+            bind_vars["site"] = site
         else:
-            structlog.contextvars.unbind_contextvars("site")
+            unbind_vars.append("site")
+        if bench_url:
+            bind_vars["bench_url"] = bench_url
+        else:
+            unbind_vars.append("bench_url")
+
+        if bind_vars:
+            structlog.contextvars.bind_contextvars(**bind_vars)
+        if unbind_vars:
+            structlog.contextvars.unbind_contextvars(*unbind_vars)
+
         try:
             return await call_next(request)
         finally:
             _site_context.set(None)
-            structlog.contextvars.unbind_contextvars("site")
+            _bench_url_context.set(None)
+            structlog.contextvars.unbind_contextvars("site", "bench_url")

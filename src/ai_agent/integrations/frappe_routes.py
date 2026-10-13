@@ -87,8 +87,11 @@ class SiteResolver:
                 raise ValueError(f"failed to load routes from {self._routes_file}: {exc}") from exc
             logger.warning("site_routes_reload_failed", error=str(exc))
 
-    def resolve(self, site: str | None) -> str:
-        """Resolve a site name to its Frappe base URL."""
+    def resolve(self, site: str | None, bench_url: str | None = None) -> str:
+        """Resolve a site name and optional bench URL override to its Frappe base URL."""
+        if bench_url and bench_url.strip():
+            return validate_url(bench_url.strip(), "X-Frappe-Bench-URL")
+
         if self._routes_file and (site is None or not site.strip()):
             raise UnknownSite("site name required when routes file configured")
 

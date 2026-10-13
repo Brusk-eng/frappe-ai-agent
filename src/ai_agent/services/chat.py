@@ -32,7 +32,7 @@ from ai_agent.config import Settings
 from ai_agent.integrations.frappe_history import FrappeHistoryClient
 from ai_agent.integrations.mcp import build_mcp_client_for_sid, filter_deprecated
 from ai_agent.middleware.sid import UserContext
-from ai_agent.middleware.site import set_current
+from ai_agent.middleware.site import set_current, set_current_bench_url
 
 logger = structlog.get_logger(__name__)
 _tracer = trace.get_tracer(__name__)
@@ -372,14 +372,19 @@ class ChatService:
         session_id: str,
         confirmation: dict[str, Any] | None,
         site_name: str | None = None,
+        bench_url: str | None = None,
     ) -> tuple[list[Any], str | None]:
         """The caller's tools, or none of them and the line telling the model why it has none."""
         # Per-request MCP client carrying the caller's sid cookie.
+        mcp_kwargs: dict[str, Any] = {}
+        if bench_url:
+            mcp_kwargs["bench_url"] = bench_url
         mcp_client = build_mcp_client_for_sid(
             self._settings,
             sid,
             confirmation["token"] if confirmation else None,
             site_name=site_name,
+            **mcp_kwargs,
         )
         tools: list[Any] = []
         unavailable_reason: str | None = None
@@ -525,6 +530,10 @@ class ChatService:
             turn["site"] = user_context.site
             set_current(user_context.site)
             structlog.contextvars.bind_contextvars(site=user_context.site)
+        if user_context.bench_url:
+            turn["bench_url"] = user_context.bench_url
+            set_current_bench_url(user_context.bench_url)
+            structlog.contextvars.bind_contextvars(bench_url=user_context.bench_url)
         try:
             with (
                 _tracer.start_as_current_span("agent.chat_turn") as turn_span,
@@ -533,6 +542,8 @@ class ChatService:
                 try:
                     if user_context.site:
                         turn_span.set_attribute("site", user_context.site)
+                    if user_context.bench_url:
+                        turn_span.set_attribute("bench_url", user_context.bench_url)
                     session_id, session_saved = await self._open_session(
                         sid=user_context.sid,
                         session_id=session_id,
@@ -578,6 +589,7 @@ class ChatService:
                         session_id=session_id,
                         confirmation=confirmation,
                         site_name=user_context.site,
+                        bench_url=user_context.frappe_base_url,
                     )
                     context_preamble = self._system_prompt(context, tools_unavailable_reason)
                     tool_registry = ToolRegistry(tools, self._settings.mcp_tool_timeout_s)
@@ -682,3 +694,6 @@ class ChatService:
             if user_context.site:
                 set_current(None)
                 structlog.contextvars.unbind_contextvars("site")
+            if user_context.bench_url:
+                set_current_bench_url(None)
+                structlog.contextvars.unbind_contextvars("bench_url")
