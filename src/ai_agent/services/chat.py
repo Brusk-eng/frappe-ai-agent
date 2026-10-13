@@ -91,6 +91,27 @@ def _tools_unavailable_message(root: BaseException) -> str:
     return "Tools unavailable."
 
 
+@contextmanager
+def _scoped_turn_context(user_context: UserContext, turn: dict[str, Any]) -> Iterator[None]:
+    if user_context.site:
+        turn["site"] = user_context.site
+        set_current(user_context.site)
+        structlog.contextvars.bind_contextvars(site=user_context.site)
+    if user_context.bench_url:
+        turn["bench_url"] = user_context.bench_url
+        set_current_bench_url(user_context.bench_url)
+        structlog.contextvars.bind_contextvars(bench_url=user_context.bench_url)
+    try:
+        yield
+    finally:
+        if user_context.site:
+            set_current(None)
+            structlog.contextvars.unbind_contextvars("site")
+        if user_context.bench_url:
+            set_current_bench_url(None)
+            structlog.contextvars.unbind_contextvars("bench_url")
+
+
 def _source_ref(item: dict[str, Any]) -> dict[str, Any]:
     """A source as it is saved: the file and the passage's place in it, never the passage itself."""
     ref: dict[str, Any] = {"file": item.get("file"), "seq": item.get("seq")}
@@ -526,15 +547,7 @@ class ChatService:
                 degraded = True
 
         turn: dict[str, Any] = {"session_id": session_id, "t0": t0}
-        if user_context.site:
-            turn["site"] = user_context.site
-            set_current(user_context.site)
-            structlog.contextvars.bind_contextvars(site=user_context.site)
-        if user_context.bench_url:
-            turn["bench_url"] = user_context.bench_url
-            set_current_bench_url(user_context.bench_url)
-            structlog.contextvars.bind_contextvars(bench_url=user_context.bench_url)
-        try:
+        with _scoped_turn_context(user_context, turn):
             with (
                 _tracer.start_as_current_span("agent.chat_turn") as turn_span,
                 _log_when_cancelled(turn, events.tools_called, events.text_parts),
@@ -690,10 +703,3 @@ class ChatService:
                     tools_failed=tools_failed,
                     error_type=error_type,
                 )
-        finally:
-            if user_context.site:
-                set_current(None)
-                structlog.contextvars.unbind_contextvars("site")
-            if user_context.bench_url:
-                set_current_bench_url(None)
-                structlog.contextvars.unbind_contextvars("bench_url")
