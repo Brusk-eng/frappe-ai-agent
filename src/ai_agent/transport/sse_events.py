@@ -26,6 +26,7 @@ class ToolConfirmEvent(TypedDict):
     id: str
     name: str
     arguments: dict[str, Any]
+    risk: NotRequired[str]
 
 
 class ContentEvent(TypedDict):

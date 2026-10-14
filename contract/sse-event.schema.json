@@ -192,6 +192,10 @@
           "title": "Name",
           "type": "string"
         },
+        "risk": {
+          "title": "Risk",
+          "type": "string"
+        },
         "type": {
           "const": "tool_confirm",
           "title": "Type",

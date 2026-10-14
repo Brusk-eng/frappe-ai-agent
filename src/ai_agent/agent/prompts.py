@@ -121,7 +121,7 @@ transaction_date, due_date), pick the one that matches the user's intent
 """
 
 
-def build_system_prompt(context: dict) -> str:
+def build_system_prompt(context: dict, skills_catalog: str = "") -> str:
     """The context preamble; a currency reaches it only when the caller named one."""
     page_context = "ERPNext (no specific page)"
     currency_line = ""
@@ -138,4 +138,7 @@ def build_system_prompt(context: dict) -> str:
         # anything but the shape of an ISO 4217 code is caller text going into the prompt
         if isinstance(code, str) and len(code) == 3 and code.isascii() and code.isalpha():
             currency_line = f"\nCurrency: {code.upper()}"
-    return SYSTEM_PROMPT.format(page_context=page_context, currency_line=currency_line)
+    prompt = SYSTEM_PROMPT.format(page_context=page_context, currency_line=currency_line)
+    if skills_catalog:
+        prompt += f"\n\n{skills_catalog}"
+    return prompt

@@ -25,6 +25,7 @@ from ai_agent.agent.condense import (
     condense_tool_result,
     unsupported_values,
 )
+from ai_agent.agent.skills import assess_risk
 from ai_agent.agent.tool_registry import AGENT_ARGS
 from ai_agent.agent.web_tools import WEB_SEARCH_TOOL
 from ai_agent.blocks.envelope import (
@@ -434,9 +435,13 @@ async def run_agent_loop(
                 _replay(messages, reply.envelope, note + "\nMake the call again, corrected.")
                 continue
             sentence = confirm_summary(name, args)
-            logger.info("agent_loop_write_needs_confirmation", tool=name, step=step)
+            risk = assess_risk(name, args)
+            logger.info("agent_loop_write_needs_confirmation", tool=name, step=step, risk=risk)
             yield {"type": "content", "text": f"\n\n{sentence}" if reply.spoke else sentence}
-            yield {"type": "tool_confirm", "id": uuid4().hex, "name": name, "arguments": args}
+            confirm_event: dict[str, Any] = {"type": "tool_confirm", "id": uuid4().hex, "name": name, "arguments": args}
+            if risk is not None:
+                confirm_event["risk"] = risk
+            yield confirm_event
             return
 
         # Repeat-detection, before anything is announced: the same calls with the same arguments

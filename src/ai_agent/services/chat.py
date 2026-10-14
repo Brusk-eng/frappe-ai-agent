@@ -27,6 +27,7 @@ if TYPE_CHECKING:
 from ai_agent.agent.leak_filter import StreamingLeakFilter
 from ai_agent.agent.loop import TurnFailure, cap_for_prompt, run_agent_loop
 from ai_agent.agent.prompts import build_system_prompt
+from ai_agent.agent.skills import build_skill_tool, build_skills_catalog, load_bundled_skills
 from ai_agent.agent.tool_registry import ToolRegistry
 from ai_agent.agent.web_tools import build_web_tools
 from ai_agent.config import Settings
@@ -324,6 +325,10 @@ class ChatService:
         self._history = history or FrappeHistoryClient(base_url=settings.frappe_url)
         # Built once: the web tools carry no per-user state, unlike the MCP client.
         self._web_tools = build_web_tools(settings)
+        # Bundled assistant skills and load_skill tool
+        self._skills = load_bundled_skills()
+        self._skill_tool = build_skill_tool(self._skills)
+        self._skills_catalog = build_skills_catalog(self._skills)
 
     async def aclose(self) -> None:
         """Release any owned async resources (HTTP connection pools, etc.)."""
@@ -457,7 +462,7 @@ class ChatService:
         if pre_count != len(tools):
             load_span.set_attribute("tools_filtered", pre_count - len(tools))
         # The agent's own tools come last and are there even when MCP is not.
-        tools = [*tools, *self._web_tools]
+        tools = [*tools, *self._web_tools, self._skill_tool]
 
         logger.debug(
             "chat_tools_loaded",
@@ -468,7 +473,12 @@ class ChatService:
 
     def _system_prompt(self, context: dict[str, Any], tools_unavailable_reason: str | None) -> str:
         """The turn's system prompt, carrying the note the model needs when its tools are down."""
-        preamble = self._build_system_prompt(context or {})
+        try:
+            preamble = self._build_system_prompt(context or {}, skills_catalog=self._skills_catalog)
+        except TypeError:
+            preamble = self._build_system_prompt(context or {})
+            if self._skills_catalog:
+                preamble += f"\n\n{self._skills_catalog}"
         if tools_unavailable_reason is None:
             return preamble
         # Soft-degraded: tell the model so it answers data
