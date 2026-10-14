@@ -24,7 +24,10 @@ if TYPE_CHECKING:
 
 from ai_agent.agent.condense import (
     check_write_data,
+    condense_doctype,
     condense_tool_result,
+    link_fields,
+    missing_required,
     unsupported_values,
 )
 from ai_agent.agent.skills import LOAD_SKILL_TOOL, Skill, assess_risk, skill_for_write
@@ -324,7 +327,7 @@ async def _write_review(
     problem = await _write_problem(name, args, registry, evidence)
     if problem is None:
         return None
-    return _as_data(f"tool {name} was not run: {problem}") + "\nMake the call again, corrected."
+    return _as_data(f"tool {name} was not run: {problem}") + _AGAIN
 
 
 def _unrenderable_events(
@@ -621,6 +624,13 @@ async def _agent_turn(
 
 
 _MAX_CORRECTIONS = 4
+# The user has already read the sentence the sent-back reply began with; a second copy of it
+# streams straight after the first.
+_AGAIN = (
+    "\nMake the call again, corrected. The user has already read what you wrote before it: do "
+    "not write it again, and say nothing about this correction. Add a sentence only for a "
+    "question you must ask the user."
+)
 # Frappe's answer to a read of a record that does not exist, as the MCP server passes it on.
 _NOT_FOUND = "DoesNotExistError"
 _FIELD_CHECKED = frozenset({"create_document", BATCH_TOOL, "update_document"})
@@ -640,17 +650,37 @@ async def _write_problem(
     meta = ""
     if "get_document" in registry.names():
         meta = await registry.ainvoke("get_document", {"doctype": "DocType", "name": doctype})
-        if meta.startswith("Tool call failed") and _NOT_FOUND in meta:
-            return (
-                f"there is no DocType {doctype!r}: it is not installed on this site, so no "
-                "record of it can be made or changed. Make no write; tell the user it is missing "
-                "and which Frappe app usually provides it, if you know."
-            )
+        # a DocType the site lacks: Frappe says so, or fails on the module it cannot import
+        if meta.startswith("Tool call failed") and (
+            _NOT_FOUND in meta or "No module named" in meta
+        ):
+            return await _missing_doctype(doctype, registry)
         # a definition that could not be read checks nothing; the write will say what it says
         if meta.startswith(("Tool call failed", "Access denied", "error:")):
             meta = ""
     problems: list[str] = []
+    creates = name != "update_document"
+    if meta and creates and not _definition_read(doctype, evidence):
+        # A create made without reading its DocType fills a name and little else. Show the model
+        # the fields once, as a careful clerk would look at the form, and let it fill the record.
+        brief = condense_doctype(meta)
+        evidence.append(brief)
+        problems.append(_brief_note(doctype, brief, WEB_SEARCH_TOOL in registry.names()))
+    checked: dict[tuple[str, str], bool] = {}  # (target, value) → exists, once a batch
     for label, row in rows:
+        if meta and creates and (empty := missing_required(meta, row)):
+            lines = [line + await _existing_records(target, registry) for line, target in empty]
+            problems.append(
+                label
+                + f"These required fields of {doctype} are empty:\n"
+                + "\n".join(lines)
+                + "\nFill each yourself: from the request or what you have read, and for a Link "
+                "field from the existing records shown (when there is only one, use it; when the "
+                "request points to one, use that). Ask the user only when it is a real choice "
+                "between several, naming them."
+            )
+        for problem in await _unknown_links(row, meta, registry, checked):
+            problems.append(label + problem)
         for problem in _row_problems(row, meta, doctype, evidence):
             if (labelled := label + problem) not in problems:
                 problems.append(labelled)
@@ -660,6 +690,141 @@ async def _write_problem(
     return " ".join(problems) or None
 
 
+async def _unknown_links(
+    row: dict[str, Any],
+    meta: str,
+    registry: ToolRegistry,
+    checked: dict[tuple[str, str], bool],
+) -> list[str]:
+    """A Link value that is no record of its target: Frappe would refuse the write after the user
+    allowed it, so the model hears it now, with the records that do exist."""
+    if not meta or "list_documents" not in registry.names():
+        return []
+    problems = []
+    for fieldname, target in link_fields(meta).items():
+        value = row.get(fieldname)
+        if not isinstance(value, str) or not value.strip():
+            continue
+        key = (target, value)
+        if key not in checked:
+            if len(checked) >= _LINKS_CHECKED:
+                break
+            found = await registry.ainvoke(
+                "list_documents",
+                {"doctype": target, "filters": {"name": value}, "fields": ["name"],
+                 "page_length": 1},
+            )  # fmt: skip
+            # an answer that could not be read checks nothing; the write will say what it says
+            checked[key] = found.startswith(("Tool call failed", "Access denied", "error:")) or (
+                f'"name": "{value}"' in found or f'"name":"{value}"' in found
+            )
+        if not checked[key]:
+            problems.append(
+                f"{fieldname} is {value!r}, which is no {target}"
+                + await _existing_records(target, registry)
+                + ". Use an existing one, put the value in the field it belongs to, "
+                "or leave it out."
+            )
+    return problems
+
+
+_LINKS_CHECKED = 10
+
+
+async def _existing_records(doctype: str, registry: ToolRegistry) -> str:
+    """The first records of a Link field's target, for the model to choose from: " (existing:
+    Example Homes, Northwind Test Ltd)", " (no Customer exists yet)", or "" when unknown."""
+    if not doctype or "list_documents" not in registry.names():
+        return ""
+    found = await registry.ainvoke(
+        "list_documents", {"doctype": doctype, "fields": ["name"], "page_length": _LINK_SHOWN + 1}
+    )
+    if found.startswith(("Tool call failed", "Access denied", "error:")):
+        return ""
+    names = re.findall(r'"name":\s*"([^"]+)"', found)
+    if not names:
+        return f" (no {doctype} exists yet)"
+    more = ", \u2026" if len(names) > _LINK_SHOWN else ""
+    return f" (existing: {', '.join(names[:_LINK_SHOWN])}{more})"
+
+
+_LINK_SHOWN = 5
+
+
+def _brief_note(doctype: str, brief: str, web: bool) -> str:
+    """The DocType's fields, shown once before a create, and how to fill them like a clerk would."""
+    note = (
+        f"Before creating a {doctype}, look at its fields:\n{brief}\n"
+        "Fill every field that the request, the earlier turns or what you have read supports. "
+        "A Link field takes the existing record that matches what you know: find it with "
+        "list_documents filtered on that value (a name like '%India%'), never by taking the "
+        "first row of an unfiltered list. An optional field nothing supports is left out: "
+        "never ask the user about an optional field, or to confirm a value you already have."
+    )
+    if web:
+        note += (
+            " A record about an organisation or person outside this site starts a business "
+            "workflow, so complete it: what the request does not give but the public web does "
+            "(its website, industry, country, address, size, what it does) you look up with "
+            "web_search, then fetch_web_page on its own site, before making the call. Put every "
+            "value you found in its field, Link fields too (the country, industry or territory "
+            "record that matches it)."
+        )
+    return note + " Then make the call."
+
+
+def _definition_read(doctype: str, evidence: list[str]) -> bool:
+    """Whether the model has the DocType's fields this turn, as condensed for the prompt."""
+    heads = (f"DocType {doctype}\n", f"DocType {doctype}: ")
+    return any(text.startswith(heads) or f"\n{heads[0]}" in text for text in evidence)
+
+
+async def _missing_doctype(doctype: str, registry: ToolRegistry) -> str:
+    """Why a write to a DocType the site lacks was sent back, with its DocTypes of a like name:
+    "Leads" on a Frappe CRM site is most likely "CRM Lead". The model judges which, if any, fits."""
+    similar: list[str] = []
+    if "list_documents" in registry.names():
+        for word in _name_words(doctype):
+            found = await registry.ainvoke(
+                "list_documents",
+                {
+                    "doctype": "DocType",
+                    "filters": {"name": ["like", f"%{word}%"], "istable": 0},
+                    "fields": ["name"],
+                    "page_length": _SIMILAR_MAX,
+                },
+            )
+            if found.startswith(("Tool call failed", "Access denied", "error:")):
+                continue
+            for name in re.findall(r'"name":\s*"([^"]+)"', found):
+                if name not in similar and name != doctype:
+                    similar.append(name)
+    if similar:
+        names = ", ".join(repr(n) for n in similar[:_SIMILAR_MAX])
+        return (
+            f"there is no DocType {doctype!r} on this site. DocTypes with similar names: {names}. "
+            "If one of them is what the user meant, learn its fields and make the call on it; "
+            "if none is, make no write and tell the user the DocType is not installed."
+        )
+    return (
+        f"there is no DocType {doctype!r}: it is not installed on this site, so no "
+        "record of it can be made or changed. Make no write; tell the user it is missing "
+        "and which Frappe app usually provides it, if you know."
+    )
+
+
+def _name_words(doctype: str) -> list[str]:
+    """The words of a DocType name worth matching on, a plural cut to its stem: "Leads" → "Lead"."""
+    words: list[str] = []
+    for word in re.findall(r"[A-Za-z0-9]+", doctype):
+        if len(word) > 3 and word.endswith("s") and not word.endswith("ss"):
+            word = word[:-1]
+        if len(word) >= 3 and word not in words:
+            words.append(word)
+    return words[:3]
+
+
+_SIMILAR_MAX = 10
 _BATCH_MAX = 100
 _MAX_ROW_PROBLEMS = 6
 

@@ -38,6 +38,20 @@ def _batch(rows: list[dict[str, Any]]) -> dict[str, Any]:
     return {"blocks": [{"type": "tool_call", "payload": call}]}
 
 
+# The model reads the DocType first, so these tests are about the batch and not the field brief.
+_READ = {
+    "blocks": [
+        {
+            "type": "tool_call",
+            "payload": {
+                "name": "get_document",
+                "arguments": {"doctype": "DocType", "name": "Task"},
+            },
+        }
+    ]
+}
+
+
 def _settings(**over) -> Settings:
     return Settings(_env_file=None, **over)  # pyright: ignore[reportCallIssue]
 
@@ -53,7 +67,7 @@ class TestBatches:
     @pytest.mark.asyncio
     async def test_a_good_batch_pauses_once_for_the_whole_list(self):
         rows = [{"subject": f"Examplia {i}", "project": "PROJ-1"} for i in range(25)]
-        llm = _fake_llm_with_yields([[_batch(rows)]])
+        llm = _fake_llm_with_yields([[_READ], [_batch(rows)]])
         reg = _Writes({"get_document": _META, "create_documents": "x"})
         events = await _drain(run_agent_loop(llm=llm, tool_registry=reg, user_message="add"))
         confirms = [e for e in events if e["type"] == "tool_confirm"]
@@ -67,13 +81,13 @@ class TestBatches:
         seen: list[Any] = []
         bad = [{"subject": "ok"}, {"subjekt": "typo"}]
         good = [{"subject": "ok"}, {"subject": "fixed"}]
-        llm = _fake_llm_with_yields([[_batch(bad)], [_batch(good)]])
+        llm = _fake_llm_with_yields([[_READ], [_batch(bad)], [_batch(good)]])
         structured = llm.with_structured_output.return_value
         original = structured.astream
         structured.astream = lambda m, config=None: (seen.append(list(m)), original(m, config))[1]
         reg = _Writes({"get_document": _META, "create_documents": "x"})
         events = await _drain(run_agent_loop(llm=llm, tool_registry=reg, user_message="add"))
-        note = str(seen[1][-1].content)
+        note = str(seen[2][-1].content)
         assert "Row 2: Task has no field named 'subjekt'" in note
         assert "Row 1:" not in note
         assert [e["type"] for e in events].count("tool_confirm") == 1
@@ -85,19 +99,23 @@ class TestBatches:
     )
     async def test_a_malformed_batch_goes_back(self, rows, says):
         seen: list[Any] = []
-        llm = _fake_llm_with_yields([[_batch(rows)], [_batch([{"subject": "a"}])]])
+        llm = _fake_llm_with_yields([[_READ], [_batch(rows)], [_batch([{"subject": "a"}])]])
         structured = llm.with_structured_output.return_value
         original = structured.astream
         structured.astream = lambda m, config=None: (seen.append(list(m)), original(m, config))[1]
         reg = _Writes({"get_document": _META, "create_documents": "x"})
         await _drain(run_agent_loop(llm=llm, tool_registry=reg, user_message="add"))
-        assert says in str(seen[1][-1].content)
+        assert says in str(seen[2][-1].content)
 
     @pytest.mark.asyncio
     async def test_over_the_cap_is_split(self):
         seen: list[Any] = []
         llm = _fake_llm_with_yields(
-            [[_batch([{"subject": str(i)} for i in range(101)])], [_batch([{"subject": "a"}])]]
+            [
+                [_READ],
+                [_batch([{"subject": str(i)} for i in range(101)])],
+                [_batch([{"subject": "a"}])],
+            ]
         )
         structured = llm.with_structured_output.return_value
         original = structured.astream
@@ -109,7 +127,7 @@ class TestBatches:
                 user_message="add",
             )
         )
-        assert "split the batch" in str(seen[1][-1].content)
+        assert "split the batch" in str(seen[2][-1].content)
 
     def test_a_batch_of_users_always_asks_and_has_its_skill(self):
         args = {"doctype": "User", "rows": [{"email": "a@example.org"}]}

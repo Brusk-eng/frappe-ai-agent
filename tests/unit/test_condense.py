@@ -69,12 +69,13 @@ class TestCondenseDoctype:
         assert "- company_name | Organization Name | Data |" in out
         assert "- country | Country | Link | | Country" in out
         assert (
-            "- status | Status | Select | required | Lead, Open, Replied, Opportunity, Quotation, "
+            "- status | Status | Select | required, fills itself | Lead, Open, Replied, Opportunity, Quotation, "
             "Lost Quotation, Interested, Converted, … (9 values); default Lead"
         ) in out
         assert "- email_id | Email | Data | unique" in out
         assert "- notes | Notes | Table | | CRM Note" in out
-        assert out.endswith("required: status")
+        # status is required but has a default, so a new Lead needs nothing more
+        assert out.endswith("must fill: none")
 
     def test_layout_and_hidden_fields_are_dropped(self):
         out = condense_doctype(_raw())

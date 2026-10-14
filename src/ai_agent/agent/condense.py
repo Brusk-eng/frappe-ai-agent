@@ -39,10 +39,11 @@ def condense_doctype(result: str) -> str:
     for f in doc["fields"]:
         if not _is_data_field(f):
             continue
-        if f.get("reqd"):
+        if _must_supply(f):
             required.append(str(f["fieldname"]))
         lines.append(_field_line(f))
-    lines.append("required: " + (", ".join(required) if required else "none"))
+    # what a new record cannot do without; a required field with a default fills itself
+    lines.append("must fill: " + (", ".join(required) if required else "none"))
     return "\n".join(lines)
 
 
@@ -72,7 +73,10 @@ def _is_data_field(f: Any) -> bool:
 
 def _field_flags(f: dict[str, Any]) -> list[str]:
     flags = []
-    for key, label in (("reqd", "required"), ("read_only", "read-only"), ("unique", "unique")):
+    if f.get("reqd"):
+        # a required field something else fills is not one the writer has to supply
+        flags.append("required" if _must_supply(f) else "required, fills itself")
+    for key, label in (("read_only", "read-only"), ("unique", "unique")):
         if f.get(key):
             flags.append(label)
     if f.get("fetch_from"):
@@ -94,9 +98,43 @@ def _field_options(f: dict[str, Any]) -> str:
             options = f"doctype named in {raw}"
         else:
             options = raw
-    if f.get("default") not in (None, ""):
-        options = (options + "; " if options else "") + f"default {f['default']}"
+    default = f.get("default")
+    if default in (None, "") and "\n" in str(f.get("options") or "").strip():
+        default = _first_option(f)  # what Frappe puts in a Select of several left empty
+    if default not in (None, ""):
+        options = (options + "; " if options else "") + f"default {default}"
     return options
+
+
+def link_fields(meta_result: str) -> dict[str, str]:
+    """The DocType's Link fields, fieldname to the DocType each one points at."""
+    doc = _doctype_document(meta_result)
+    if doc is None:
+        return {}
+    return {
+        str(f["fieldname"]): str(f["options"])
+        for f in doc["fields"]
+        if _is_data_field(f) and f.get("fieldtype") == "Link" and f.get("options")
+    }
+
+
+def _must_supply(f: Any) -> bool:
+    """A required field nothing fills: no default, not read-only, not fetched, not a Select."""
+    return (
+        _is_data_field(f)
+        and bool(f.get("reqd"))
+        and f.get("default") in (None, "")
+        and not f.get("read_only")
+        and not f.get("fetch_from")
+        and not _first_option(f)
+    )
+
+
+def _first_option(f: dict[str, Any]) -> str:
+    """A Select's first option, which Frappe sets when the field is left empty; else ""."""
+    if f.get("fieldtype") != "Select":
+        return ""
+    return str(f.get("options") or "").split("\n")[0].strip()
 
 
 def _field_line(f: dict[str, Any]) -> str:
@@ -155,6 +193,24 @@ def check_write_data(meta_result: str, doctype: str, data: Any) -> str | None:
                 f"not {type(value).__name__}."
             )
     return " ".join(problems) or None
+
+
+def missing_required(meta_result: str, data: Any) -> list[tuple[str, str]]:
+    """The required fields a new document leaves empty: (described line, Link target or "").
+
+    A field with a default, a read-only one, one fetched from a link, or a Select (Frappe takes
+    its first option) fills itself, so only the ones the writer must supply are named.
+    `meta_result` is the raw `get_document` answer.
+    """
+    doc = _doctype_document(meta_result)
+    if doc is None or not isinstance(data, dict):
+        return []
+    missing = []
+    for f in doc["fields"]:
+        if _must_supply(f) and data.get(f["fieldname"]) in (None, "", []):
+            target = str(f.get("options") or "") if f.get("fieldtype") == "Link" else ""
+            missing.append((_field_line(f), target))
+    return missing
 
 
 _URL_VALUE = re.compile(r"^https?://\S+$", re.IGNORECASE)

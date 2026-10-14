@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -765,6 +766,201 @@ class TestWriteToMissingDocType:
         events = await _drain(run_agent_loop(llm=llm, tool_registry=reg, user_message="add"))
         assert not [e for e in events if e["type"] == "tool_confirm"]
         assert "not installed on this site" in str(seen[1][-1].content)
+
+
+class TestNearestDocType:
+    """A missing DocType comes back with the site's DocTypes of a like name for the model."""
+
+    class _Reg(_FakeRegistry):
+        def writes(self, name: str) -> bool:
+            return name == "create_document"
+
+    @pytest.mark.asyncio
+    async def test_similar_doctypes_are_offered(self):
+        from ai_agent.agent.loop import _write_problem
+
+        reg = self._Reg(
+            {
+                "get_document": "Tool call failed: DocType/Leads: Resource not found (HTTP 404). "
+                "DoesNotExistError",
+                "list_documents": "Retrieved 2 DocType documents (page 1)\n"
+                '{"data": [{"name": "CRM Lead"}, {"name": "CRM Lead Source"}]}',
+            }
+        )
+        problem = await _write_problem(
+            "create_document", {"doctype": "Leads", "data": {"first_name": "A"}}, reg, []
+        )
+        assert problem is not None
+        assert "'CRM Lead'" in problem and "'CRM Lead Source'" in problem
+        lookups = [a for n, a in reg.calls if n == "list_documents"]
+        # the plural's stem, never a child table
+        assert lookups and lookups[0]["filters"] == {"name": ["like", "%Lead%"], "istable": 0}
+
+    @pytest.mark.asyncio
+    async def test_no_similar_doctype_says_not_installed(self):
+        from ai_agent.agent.loop import _write_problem
+
+        reg = self._Reg(
+            {
+                "get_document": "Tool call failed: DocType/Project: DoesNotExistError",
+                "list_documents": 'Retrieved 0 DocType documents (page 1)\n{"data": []}',
+            }
+        )
+        problem = await _write_problem(
+            "create_document", {"doctype": "Project", "data": {"project_name": "A"}}, reg, []
+        )
+        assert problem is not None and "not installed on this site" in problem
+        assert "similar" not in problem
+
+
+class TestCreateIsFilledWell:
+    """A create is sent back once with the DocType's fields, and again while a required one is
+    empty: the model fills the record from what it knows, and asks for what it cannot find."""
+
+    _META = (
+        'Retrieved DocType document: Project\n{"name": "Project", "autoname": "Prompt", "fields": ['
+        '{"fieldname": "project_name", "label": "Project Name", "fieldtype": "Data", "reqd": 1},'
+        '{"fieldname": "customer", "label": "Customer", "fieldtype": "Link", "options": "Customer",'
+        ' "reqd": 1},'
+        '{"fieldname": "status", "label": "Status", "fieldtype": "Select", "reqd": 1,'
+        ' "options": "Open\\nCompleted", "default": "Open"},'
+        '{"fieldname": "company", "label": "Company", "fieldtype": "Link", "options": "Company",'
+        ' "reqd": 1, "fetch_from": "customer.company"},'
+        '{"fieldname": "expected_end_date", "label": "Expected End Date", "fieldtype": "Date"}]}'
+    )
+
+    class _Reg(_FakeRegistry):
+        def writes(self, name: str) -> bool:
+            return name in ("create_document", "update_document")
+
+    @staticmethod
+    def _call(name: str, args: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "blocks": [
+                {"type": "text", "payload": {"content": "Adding it."}},
+                {"type": "tool_call", "payload": {"name": name, "arguments": args}},
+            ]
+        }
+
+    def _create(self, data: dict[str, Any]) -> dict[str, Any]:
+        return self._call("create_document", {"doctype": "Project", "data": data})
+
+    async def _run(self, iterations: list[list[dict[str, Any]]]):
+        seen: list[Any] = []
+        llm = _fake_llm_with_yields(iterations)
+        structured = llm.with_structured_output.return_value
+        original = structured.astream
+        structured.astream = lambda messages, config=None: (
+            seen.append(list(messages)),
+            original(messages, config),
+        )[1]
+        reg = self._Reg(
+            {
+                "get_document": self._META,
+                "create_document": "x",
+                "list_documents": "Retrieved 1 Customer documents (page 1)\n"
+                '{"data": [{"name": "Example Homes"}]}',
+            }
+        )
+        events = await _drain(run_agent_loop(llm=llm, tool_registry=reg, user_message="add"))
+        return events, seen
+
+    @pytest.mark.asyncio
+    async def test_bare_create_gets_the_fields_then_the_full_one_asks_the_user(self):
+        full = {"project_name": "Home build", "customer": "Example Homes"}
+        events, seen = await self._run([[self._create({"project_name": "Home build"})],
+                                        [self._create(full)]])  # fmt: skip
+        brief = str(seen[1][-1].content)
+        assert "expected_end_date" in brief and "Customer" in brief
+        confirms = [e for e in events if e["type"] == "tool_confirm"]
+        assert len(confirms) == 1 and confirms[0]["arguments"]["data"] == full
+
+    @pytest.mark.asyncio
+    async def test_required_field_left_empty_is_named(self):
+        events, seen = await self._run(
+            [
+                [self._create({"project_name": "Home build"})],
+                [self._create({"project_name": "Home build"})],
+                [{"blocks": [{"type": "text", "payload": {"content": "Which customer?"}}]}],
+            ]
+        )
+        second = str(seen[2][-1].content)
+        assert "required" in second and "customer" in second
+        # the Link's records are looked up for the model, not left to the user
+        assert "(existing: Example Homes" in second
+        # a default or a fetched value fills itself
+        assert "status" not in second.split("required")[1] and "company" not in second
+        assert not [e for e in events if e["type"] == "tool_confirm"]
+
+    @pytest.mark.asyncio
+    async def test_definition_already_read_is_not_sent_again(self):
+        read = self._call("get_document", {"doctype": "DocType", "name": "Project"})
+        full = {"project_name": "Home build", "customer": "Example Homes"}
+        events, _ = await self._run([[read], [self._create(full)]])
+        assert len([e for e in events if e["type"] == "tool_confirm"]) == 1
+
+    @pytest.mark.asyncio
+    async def test_update_is_neither_briefed_nor_held_to_required_fields(self):
+        update = self._call(
+            "update_document",
+            {"doctype": "Project", "name": "PROJ-1", "data": {"expected_end_date": "2026-12-01"}},
+        )
+        events, _ = await self._run([[update]])
+        assert len([e for e in events if e["type"] == "tool_confirm"]) == 1
+
+
+class TestLinkValuesExist:
+    """A Link value that is no record of its target goes back, with the records that do exist."""
+
+    _META = (
+        'Retrieved DocType document: Project\n{"name": "Project", "fields": ['
+        '{"fieldname": "project_name", "label": "Project Name", "fieldtype": "Data", "reqd": 1},'
+        '{"fieldname": "customer", "label": "Customer", "fieldtype": "Link",'
+        ' "options": "Customer"},'
+        '{"fieldname": "company", "label": "Company", "fieldtype": "Link", "options": "Company"}]}'
+    )
+
+    class _Reg(_FakeRegistry):
+        def writes(self, name: str) -> bool:
+            return name == "create_document"
+
+        async def ainvoke(self, name: str, args: dict[str, Any] | None) -> str:
+            self.calls.append((name, args or {}))
+            if name == "get_document":
+                return TestLinkValuesExist._META
+            if name == "list_documents":
+                rows = {"Customer": ["Example Homes"], "Company": ["Example Builders"]}
+                names = rows.get(str((args or {}).get("doctype")), [])
+                wanted = ((args or {}).get("filters") or {}).get("name")
+                if isinstance(wanted, str):
+                    names = [n for n in names if n == wanted]
+                return "Retrieved\n" + json.dumps({"data": [{"name": n} for n in names]})
+            return "x"
+
+    @pytest.mark.asyncio
+    async def test_unknown_link_value_is_named_with_the_existing_ones(self):
+        from ai_agent.agent.loop import _write_problem
+
+        reg = self._Reg({"get_document": "", "list_documents": "", "create_document": ""})
+        data = {"project_name": "Home build", "customer": "Example Builders"}
+        problem = await _write_problem(
+            "create_document", {"doctype": "Project", "data": data}, reg, ["DocType Project\n"]
+        )
+        assert problem is not None
+        assert "customer is 'Example Builders', which is no Customer" in problem
+        assert "Example Homes" in problem
+
+    @pytest.mark.asyncio
+    async def test_existing_link_values_pass(self):
+        from ai_agent.agent.loop import _write_problem
+
+        reg = self._Reg({"get_document": "", "list_documents": "", "create_document": ""})
+        data = {"project_name": "Home build", "customer": "Example Homes",
+                "company": "Example Builders"}  # fmt: skip
+        problem = await _write_problem(
+            "create_document", {"doctype": "Project", "data": data}, reg, ["DocType Project\n"]
+        )
+        assert problem is None
 
 
 class TestWriteProvenance:
