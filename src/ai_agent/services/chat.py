@@ -93,21 +93,23 @@ def _tools_unavailable_message(root: BaseException) -> str:
 
 @contextmanager
 def _scoped_turn_context(user_context: UserContext, turn: dict[str, Any]) -> Iterator[None]:
+    # the resolved URL, never the caller's X-Frappe-Bench-URL: that header is only a routing hint
+    bench_url = user_context.frappe_base_url or None
     if user_context.site:
         turn["site"] = user_context.site
         set_current(user_context.site)
         structlog.contextvars.bind_contextvars(site=user_context.site)
-    if user_context.bench_url:
-        turn["bench_url"] = user_context.bench_url
-        set_current_bench_url(user_context.bench_url)
-        structlog.contextvars.bind_contextvars(bench_url=user_context.bench_url)
+    if bench_url:
+        turn["bench_url"] = bench_url
+        set_current_bench_url(bench_url)
+        structlog.contextvars.bind_contextvars(bench_url=bench_url)
     try:
         yield
     finally:
         if user_context.site:
             set_current(None)
             structlog.contextvars.unbind_contextvars("site")
-        if user_context.bench_url:
+        if bench_url:
             set_current_bench_url(None)
             structlog.contextvars.unbind_contextvars("bench_url")
 
@@ -555,8 +557,8 @@ class ChatService:
                 try:
                     if user_context.site:
                         turn_span.set_attribute("site", user_context.site)
-                    if user_context.bench_url:
-                        turn_span.set_attribute("bench_url", user_context.bench_url)
+                    if user_context.frappe_base_url:
+                        turn_span.set_attribute("bench_url", user_context.frappe_base_url)
                     session_id, session_saved = await self._open_session(
                         sid=user_context.sid,
                         session_id=session_id,

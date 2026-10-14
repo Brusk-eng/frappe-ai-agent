@@ -273,27 +273,30 @@ async def test_chat_service_streamed_turn_binds_site_contextvar():
     assert current() is None
 
 
-def test_site_resolver_bench_url_override(tmp_path):
-    routes_file = tmp_path / "routes.yaml"
-    routes_file.write_text("routes:\n  tenant-1.local: http://bench-01:8000\n")
-
+def test_site_resolver_bench_url_override():
     resolver = SiteResolver(
         default_url="http://bench-default:8000",
-        routes_file=str(routes_file),
+        url_template="http://bench-{site}.frappe.svc.cluster.local:8000",
     )
-    # When bench_url is provided, it overrides routes file mapping
+    # Header override takes precedence over both default and template for dynamic cloud sites
     assert (
-        resolver.resolve("tenant-1.local", bench_url="http://override-bench:8000")
-        == "http://override-bench:8000"
-    )
-    # When bench_url is provided for an unknown site, it resolves without error
-    assert (
-        resolver.resolve("unknown.local", bench_url="http://dynamic-bench:8000")
+        resolver.resolve("tenant-a", bench_url="http://dynamic-bench:8000")
         == "http://dynamic-bench:8000"
     )
-    # When bench_url is invalid, ValueError is raised
+    assert (
+        resolver.resolve(None, bench_url="http://dynamic-bench:8000") == "http://dynamic-bench:8000"
+    )
+    # Strips trailing slash
+    assert (
+        resolver.resolve("tenant-a", bench_url="http://dynamic-bench:8000/")
+        == "http://dynamic-bench:8000"
+    )
+    # When no bench_url, falls back to normal resolution
+    assert resolver.resolve("tenant-a") == "http://bench-tenant-a.frappe.svc.cluster.local:8000"
+    assert resolver.resolve(None) == "http://bench-default:8000"
+    # Malformed bench_url raises ValueError
     with pytest.raises(ValueError, match="URL must be an absolute http"):
-        resolver.resolve("tenant-1.local", bench_url="not-a-valid-url")
+        resolver.resolve("tenant-a", bench_url="not-a-valid-url")
 
 
 def test_site_middleware_sets_bench_url_context_and_cleans_up():

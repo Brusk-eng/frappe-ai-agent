@@ -255,11 +255,12 @@ One agent can serve any number of Frappe sites, on one bench or on several. A si
 
 **How a request finds its site.** The caller names the site in the `X-Frappe-Site-Name` header; `frappe_ai` sends it automatically. The agent validates the caller's `sid` against that site and nothing else, so a session from one site presented with another site's name is refused with `401`. The same site name goes on every call the agent makes for the request: the session check, chat-history reads and writes, and the MCP server. A request that names no site is handled exactly as before, against `AI_AGENT_FRAPPE_URL`.
 
-**How a site finds its bench.** The agent resolves a site's Frappe URL from its own settings, in this order, and never from the caller:
+**How a site finds its bench.** The agent resolves a site's Frappe URL in this order:
 
-1. `AI_AGENT_FRAPPE_SITE_ROUTES_FILE` — a YAML file mapping site names to bench URLs. A site missing from the file is refused with `400`, as is a request that names no site. The file is re-read when it changes, so adding a site needs no restart.
-2. `AI_AGENT_FRAPPE_SITE_URL_TEMPLATE` — a URL with a `{site}` placeholder, for platforms whose bench addresses follow a pattern.
-3. `AI_AGENT_FRAPPE_URL` — the single default.
+1. `X-Frappe-Bench-URL` header — dynamic bench URL passed by the caller (useful for cloud/multi-tenant platforms where benches are dynamically provisioned).
+2. `AI_AGENT_FRAPPE_SITE_ROUTES_FILE` — a YAML file mapping site names to bench URLs. A site missing from the file is refused with `400`, as is a request that names no site. The file is re-read when it changes, so adding a site needs no restart.
+3. `AI_AGENT_FRAPPE_SITE_URL_TEMPLATE` — a URL with a `{site}` placeholder, for platforms whose bench addresses follow a pattern.
+4. `AI_AGENT_FRAPPE_URL` — the single default fallback.
 
 ```yaml
 # site_routes.yaml
