@@ -13,7 +13,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   `AI_AGENT_WEB_SEARCH_PROVIDER`: a self-hosted SearXNG, Brave, Tavily, DuckDuckGo with no key
   (laptop use; most server networks get a human check), or `off`, the default. Search results
   go out as a `sources` event; a page fetch refuses private and loopback addresses on every
-  redirect hop.
+  redirect hop. Safe search is `strict` by default (`AI_AGENT_WEB_SAFE_SEARCH`), and
+  `AI_AGENT_WEB_BLOCKED_DOMAINS` / `AI_AGENT_WEB_ALLOWED_DOMAINS` drop results and refuse fetches,
+  redirects included.
 - **The user allows or denies a write.** Before `create_document`, `update_document`,
   `delete_document` or any other tool that changes data, the turn stops and sends a
   `tool_confirm` SSE event; the tool runs only on the next turn, carrying a one-time token the

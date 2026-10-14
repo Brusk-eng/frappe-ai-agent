@@ -308,3 +308,122 @@ class TestSettings:
         assert s.web_search_provider == "off"
         assert cast(str, s.web_search_api_key) == ""
         assert build_web_tools(s) == []
+
+
+class TestSafeSearch:
+    """The level reaches each provider in the form that provider takes."""
+
+    @pytest.mark.parametrize(("level", "kp"), [("off", "-2"), ("moderate", "-1"), ("strict", "1")])
+    @respx.mock
+    async def test_duckduckgo_kp(self, level: str, kp: str):
+        route = respx.get("https://html.duckduckgo.com/html/").mock(
+            return_value=httpx.Response(200, text=_DDG_PAGE)
+        )
+        await WebClient(provider="duckduckgo", safe_search=level).search("q")
+        assert route.calls.last.request.url.params["kp"] == kp
+
+    @pytest.mark.parametrize(("level", "value"), [("off", "0"), ("moderate", "1"), ("strict", "2")])
+    @respx.mock
+    async def test_searxng_safesearch(self, level: str, value: str):
+        route = respx.get("http://searx.test/search").mock(
+            return_value=httpx.Response(200, json={"results": []})
+        )
+        await WebClient(provider="searxng", base_url="http://searx.test", safe_search=level).search(
+            "q"
+        )
+        assert route.calls.last.request.url.params["safesearch"] == value
+
+    @pytest.mark.parametrize("level", ["off", "moderate", "strict"])
+    @respx.mock
+    async def test_brave_safesearch(self, level: str):
+        route = respx.get("https://api.search.brave.com/res/v1/web/search").mock(
+            return_value=httpx.Response(200, json={"web": {"results": []}})
+        )
+        await WebClient(provider="brave", api_key="k", safe_search=level).search("q")
+        assert route.calls.last.request.url.params["safesearch"] == level
+
+    def test_default_is_strict_and_unknown_levels_are_refused(self):
+        assert WebClient(provider="off").safe_search == "strict"
+        assert _settings().web_safe_search == "strict"
+        with pytest.raises(ValueError, match="safe search"):
+            WebClient(provider="off", safe_search="very")
+        with pytest.raises(ValueError, match="web_safe_search"):
+            _settings(web_safe_search="very")
+
+
+class TestDomainPolicy:
+    def test_block_list_covers_subdomains_but_not_lookalikes(self):
+        c = WebClient(provider="off", blocked_domains=("bad.test",))
+        assert not c.allows("https://bad.test/x")
+        assert not c.allows("https://www.bad.test/x")
+        assert not c.allows("https://a.b.bad.test/x")
+        assert c.allows("https://notbad.test/x")
+        assert c.allows("https://bad.test.example.org/x")
+
+    def test_allow_list_admits_only_its_domains_and_block_still_wins(self):
+        c = WebClient(
+            provider="off",
+            allowed_domains=("docs.test", "ok.test"),
+            blocked_domains=("evil.docs.test",),
+        )
+        assert c.allows("https://docs.test/a") and c.allows("https://sub.ok.test/")
+        assert not c.allows("https://other.test/")
+        assert not c.allows("https://evil.docs.test/")
+
+    def test_no_lists_allows_any_host_and_a_hostless_url_never(self):
+        c = WebClient(provider="off")
+        assert c.allows("https://anything.test/")
+        assert not c.allows("not a url")
+
+    def test_entries_are_normalised(self):
+        c = WebClient(provider="off", blocked_domains=("*.Bad.TEST", ".other.test"))
+        assert not c.allows("https://x.bad.test/") and not c.allows("https://other.test/")
+
+    @respx.mock
+    async def test_search_results_are_filtered(self):
+        rows = [
+            {"title": "ok", "url": "https://good.test/a", "content": ""},
+            {"title": "blocked", "url": "https://www.bad.test/b", "content": ""},
+        ]
+        respx.get("http://searx.test/search").mock(
+            return_value=httpx.Response(200, json={"results": rows})
+        )
+        hits = await WebClient(
+            provider="searxng", base_url="http://searx.test", blocked_domains=("bad.test",)
+        ).search("q")
+        assert [h.url for h in hits] == ["https://good.test/a"]
+
+    @respx.mock
+    async def test_fetch_refuses_a_blocked_site_and_a_redirect_into_one(self):
+        respx.get("https://good.test/r").mock(
+            return_value=httpx.Response(302, headers={"location": "https://www.bad.test/x"})
+        )
+        client = WebClient(provider="off", blocked_domains=("bad.test",))
+        with patch("ai_agent.integrations.web._resolve", return_value=["93.184.216.34"]):
+            with pytest.raises(WebError, match="not allowed"):
+                await client.fetch("https://bad.test/x", max_chars=300)
+            with pytest.raises(WebError, match="not allowed"):
+                await client.fetch("https://good.test/r", max_chars=300)
+
+    @respx.mock
+    async def test_allow_list_blocks_fetching_everything_else(self):
+        client = WebClient(provider="off", allowed_domains=("docs.test",))
+        with pytest.raises(WebError, match="not allowed"):
+            await client.fetch("https://elsewhere.test/", max_chars=300)
+
+    async def test_tools_are_built_with_the_settings_policy(self):
+        s = _settings(
+            web_search_provider="duckduckgo",
+            web_blocked_domains="bad.test, *.worse.test",
+            web_safe_search="moderate",
+        )
+        registry = ToolRegistry(build_web_tools(s))
+        result = await registry.ainvoke(WEB_FETCH_TOOL, {"url": "https://x.worse.test/"})
+        assert "not allowed" in result
+
+    @pytest.mark.parametrize("bad", ["https://bad.test/path", "bad", "bad.test extra"])
+    def test_malformed_domain_entries_fail_startup(self, bad: str):
+        with pytest.raises(ValueError, match="not a domain"):
+            _settings(web_blocked_domains=bad)
+        with pytest.raises(ValueError, match="not a domain"):
+            _settings(web_allowed_domains=bad)

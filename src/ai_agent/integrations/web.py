@@ -28,6 +28,7 @@ from urllib.parse import parse_qs, urljoin, urlparse
 
 import httpx
 
+from ai_agent.config import WEB_SAFE_SEARCH_LEVELS, parse_domains
 from ai_agent.config import WEB_SEARCH_PROVIDERS as PROVIDERS
 
 _DUCKDUCKGO_URL = "https://html.duckduckgo.com/html/"
@@ -65,14 +66,42 @@ class WebClient:
         api_key: str = "",
         timeout_s: float = 10.0,
         max_results: int = 5,
+        safe_search: str = "strict",
+        blocked_domains: tuple[str, ...] = (),
+        allowed_domains: tuple[str, ...] = (),
     ) -> None:
         if provider not in PROVIDERS:
             raise ValueError(f"unknown web search provider {provider!r}; one of {PROVIDERS}")
+        if safe_search not in WEB_SAFE_SEARCH_LEVELS:
+            raise ValueError(f"unknown safe search level {safe_search!r}")
+        self.safe_search = safe_search
+        self.blocked_domains = tuple(parse_domains(",".join(blocked_domains)))
+        self.allowed_domains = tuple(parse_domains(",".join(allowed_domains)))
         self.provider = provider
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.timeout_s = timeout_s
         self.max_results = max_results
+
+    # ------------------------------------------------------------------ policy
+
+    def allows(self, url: str) -> bool:
+        """Whether the domain policy lets this address be listed or fetched."""
+        host = (urlparse(url).hostname or "").lower().rstrip(".")
+        if not host:
+            return False
+
+        def covered(domains: tuple[str, ...]) -> bool:
+            return any(host == d or host.endswith("." + d) for d in domains)
+
+        if covered(self.blocked_domains):
+            return False
+        return not self.allowed_domains or covered(self.allowed_domains)
+
+    @property
+    def _level(self) -> int:
+        """0 off, 1 moderate, 2 strict: the scale SearXNG and Brave's names map onto."""
+        return WEB_SAFE_SEARCH_LEVELS.index(self.safe_search)
 
     # ------------------------------------------------------------------ search
 
@@ -98,12 +127,13 @@ class WebClient:
                 raise WebError(
                     f"The search service could not be reached: {type(exc).__name__}."
                 ) from exc
-        return hits[: self.max_results]
+        return [h for h in hits if self.allows(h.url)][: self.max_results]
 
     async def _duckduckgo(self, client: httpx.AsyncClient, query: str) -> list[SearchHit]:
         response = await client.get(
             _DUCKDUCKGO_URL,
-            params={"q": query, "kl": "wt-wt"},
+            # kp: 1 strict, -1 moderate, -2 off
+            params={"q": query, "kl": "wt-wt", "kp": {0: "-2", 1: "-1", 2: "1"}[self._level]},
             headers={"User-Agent": _USER_AGENT, "Accept": "text/html"},
         )
         response.raise_for_status()
@@ -122,7 +152,7 @@ class WebClient:
             raise WebError("No SearXNG URL is configured.")
         response = await client.get(
             f"{self.base_url}/search",
-            params={"q": query, "format": "json", "safesearch": "1"},
+            params={"q": query, "format": "json", "safesearch": str(self._level)},
             headers={"Accept": "application/json"},
         )
         response.raise_for_status()
@@ -138,7 +168,12 @@ class WebClient:
             raise WebError("No Brave Search API key is configured.")
         response = await client.get(
             _BRAVE_URL,
-            params={"q": query, "count": self.max_results},
+            params={
+                "q": query,
+                # ask for more than we keep: the domain policy may drop some
+                "count": min(20, self.max_results * 3),
+                "safesearch": ("off", "moderate", "strict")[self._level],
+            },
             headers={"Accept": "application/json", "X-Subscription-Token": self.api_key},
         )
         response.raise_for_status()
@@ -172,6 +207,8 @@ class WebClient:
         url = url.strip()
         async with httpx.AsyncClient(timeout=self.timeout_s, follow_redirects=False) as client:
             for _ in range(_MAX_REDIRECTS + 1):
+                if not self.allows(url):
+                    raise WebError("That site is not allowed by this assistant's web policy.")
                 await _refuse_private(url)
                 try:
                     response = await client.get(

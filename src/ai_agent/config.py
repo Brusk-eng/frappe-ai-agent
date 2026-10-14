@@ -15,6 +15,18 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
 # The web search backends integrations/web.py implements; `off` registers no web tools.
 WEB_SEARCH_PROVIDERS = ("duckduckgo", "searxng", "brave", "tavily", "off")
+# How hard a search engine is asked to filter adult content; best effort, each engine decides.
+WEB_SAFE_SEARCH_LEVELS = ("off", "moderate", "strict")
+
+
+def parse_domains(raw: str) -> tuple[str, ...]:
+    """A comma-separated domain list as lower-case names, without `*.` or a leading dot."""
+    out = []
+    for part in raw.split(","):
+        name = part.strip().lower().removeprefix("*.").lstrip(".")
+        if name:
+            out.append(name)
+    return tuple(out)
 
 
 class Settings(BaseSettings):
@@ -91,6 +103,14 @@ class Settings(BaseSettings):
     web_search_api_key: str = ""
     # One search or page fetch's bound; inside the tool-call bound, so a slow site is a result.
     web_timeout_s: float = 10.0
+    # Adult-content filtering asked of the search engine. Strict by default; best effort, since
+    # each upstream engine applies its own rules (tavily takes no such setting).
+    web_safe_search: str = "strict"
+    # Comma-separated domains. A blocked domain, and its subdomains, is dropped from search
+    # results and never fetched. When an allow list is set, only those domains' results are
+    # kept and only those pages fetched; the block list still applies on top.
+    web_blocked_domains: str = ""
+    web_allowed_domains: str = ""
 
     @model_validator(mode="after")
     def _validate_web(self) -> Settings:
@@ -105,6 +125,12 @@ class Settings(BaseSettings):
             )
         if self.web_timeout_s <= 0:
             raise ValueError("web_timeout_s must be positive")
+        if self.web_safe_search not in WEB_SAFE_SEARCH_LEVELS:
+            raise ValueError(f"web_safe_search must be one of {WEB_SAFE_SEARCH_LEVELS}")
+        for name in ("web_blocked_domains", "web_allowed_domains"):
+            for entry in parse_domains(getattr(self, name)):
+                if "/" in entry or " " in entry or "." not in entry:
+                    raise ValueError(f"{name}: {entry!r} is not a domain such as example.org")
         return self
 
     # Each /health probe's httpx timeout, per operation. The two run at once, so a hung

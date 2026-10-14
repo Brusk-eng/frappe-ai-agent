@@ -178,6 +178,9 @@ there is silent — check the resolved values on `GET /config`.
 | `AI_AGENT_WEB_SEARCH_PROVIDER` | `off` | The backend of the agent's built-in `web_search` tool: `searxng` (self-hosted, needs `AI_AGENT_WEB_SEARCH_URL`), `brave` or `tavily` (need `AI_AGENT_WEB_SEARCH_API_KEY`), `duckduckgo` (no key, laptop use only), or `off` to register no web tools. See "Web search" |
 | `AI_AGENT_WEB_SEARCH_URL` | _empty_ | Base URL of the SearXNG instance, for the `searxng` provider |
 | `AI_AGENT_WEB_SEARCH_API_KEY` | _empty_ | API key for the `brave` and `tavily` providers |
+| `AI_AGENT_WEB_SAFE_SEARCH` | `strict` | How hard the search engine is asked to filter adult content: `off`, `moderate` or `strict`. Best effort: each upstream engine applies its own rules, and `tavily` takes no such setting |
+| `AI_AGENT_WEB_BLOCKED_DOMAINS` | _empty_ | Comma-separated domains (`example.org`, no scheme or path). A blocked domain and its subdomains are dropped from search results and never fetched, including through a redirect |
+| `AI_AGENT_WEB_ALLOWED_DOMAINS` | _empty_ | Comma-separated domains. When set, only these (and their subdomains) are listed or fetched; the block list still applies on top |
 | `AI_AGENT_WEB_TIMEOUT_S` | `10.0` | Bound on one web search or page fetch, inside the tool-call bound |
 | `AI_AGENT_HEALTH_PROBE_TIMEOUT_S` | `5.0` | Timeout on the agent's own `/health` reachability pings against MCP and Ollama |
 | `AI_AGENT_FRAPPE_URL` | `http://localhost:8000` | Frappe URL for chat history writes |
@@ -253,6 +256,13 @@ The backend is `AI_AGENT_WEB_SEARCH_PROVIDER`:
 | `brave` | `AI_AGENT_WEB_SEARCH_API_KEY` | Brave Search API |
 | `tavily` | `AI_AGENT_WEB_SEARCH_API_KEY` | Tavily |
 | `duckduckgo` | nothing | DuckDuckGo's HTML endpoint, parsed here. From most server networks DuckDuckGo answers with a human check instead of results; the tool then fails with a line naming the fix. Fine on a laptop, not for a deployment |
+
+**Filters.** Safe search defaults to `strict` and is sent to every provider in the form it takes. It
+is the search engine's own filter, so treat it as best effort. The domain lists are the agent's own
+and are exact: a block list drops results and refuses fetches (a redirect into a blocked site is
+refused too); an allow list limits both to the listed domains, which suits a regulated tenant.
+Neither list stops a page from containing instructions meant for the model; fetched text is
+fenced as data, and every write still needs the user's confirmation.
 
 A missing URL or key for the chosen provider fails startup. `fetch_web_page` resolves the host
 itself and refuses private, loopback, link-local and `.localhost` addresses on every redirect

@@ -10,7 +10,7 @@ from __future__ import annotations
 from langchain_core.tools import BaseTool, StructuredTool
 from pydantic import BaseModel, Field
 
-from ai_agent.config import Settings
+from ai_agent.config import Settings, parse_domains
 from ai_agent.integrations.web import WebClient, WebError, hits_as_json
 
 WEB_SEARCH_TOOL = "web_search"
@@ -41,6 +41,9 @@ def build_web_tools(settings: Settings) -> list[BaseTool]:
         base_url=settings.web_search_url,
         api_key=settings.web_search_api_key,
         timeout_s=settings.web_timeout_s,
+        safe_search=settings.web_safe_search,
+        blocked_domains=parse_domains(settings.web_blocked_domains),
+        allowed_domains=parse_domains(settings.web_allowed_domains),
     )
     max_chars = settings.agent_prompt_text_max_chars
 
