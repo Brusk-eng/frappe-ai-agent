@@ -8,6 +8,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- **Built-in web search.** Two tools of the agent's own, `web_search` and `fetch_web_page`,
+  registered beside the MCP tools on every turn; no MCP server to deploy. The backend is
+  `AI_AGENT_WEB_SEARCH_PROVIDER`: a self-hosted SearXNG, Brave, Tavily, DuckDuckGo with no key
+  (laptop use; most server networks get a human check), or `off`, the default. Search results
+  go out as a `sources` event; a page fetch refuses private and loopback addresses on every
+  redirect hop.
 - **The user allows or denies a write.** Before `create_document`, `update_document`,
   `delete_document` or any other tool that changes data, the turn stops and sends a
   `tool_confirm` SSE event; the tool runs only on the next turn, carrying a one-time token the

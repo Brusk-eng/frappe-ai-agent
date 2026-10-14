@@ -28,6 +28,7 @@ from ai_agent.agent.leak_filter import StreamingLeakFilter
 from ai_agent.agent.loop import TurnFailure, cap_for_prompt, run_agent_loop
 from ai_agent.agent.prompts import build_system_prompt
 from ai_agent.agent.tool_registry import ToolRegistry
+from ai_agent.agent.web_tools import build_web_tools
 from ai_agent.config import Settings
 from ai_agent.integrations.frappe_history import FrappeHistoryClient
 from ai_agent.integrations.mcp import build_mcp_client_for_sid, filter_deprecated
@@ -49,7 +50,11 @@ ANSWER_STOPPED = "The answer was stopped. Ask again for a full answer."
 
 # The confirmed turn's question, written here rather than by the model: the user clicked a button,
 # so there is no message of theirs to replay and nothing of the model's may stand in for one.
-CONFIRMED_TURN = "The user allowed this action and it has run. Tell them the result."
+CONFIRMED_TURN = (
+    "The user allowed this action and it has run. Tell them the result in a line. If the task "
+    "you were doing has more changes left, make the next one now, as its own tool call; if "
+    "not, finish with a short summary of everything that was done."
+)
 
 # The turn is already over when a stopped answer is written, so that save gets its own budget.
 _STOPPED_SAVE_TIMEOUT_S = 5
@@ -317,6 +322,8 @@ class ChatService:
         self._llm = llm
         self._build_system_prompt = system_prompt_builder
         self._history = history or FrappeHistoryClient(base_url=settings.frappe_url)
+        # Built once: the web tools carry no per-user state, unlike the MCP client.
+        self._web_tools = build_web_tools(settings)
 
     async def aclose(self) -> None:
         """Release any owned async resources (HTTP connection pools, etc.)."""
@@ -449,6 +456,8 @@ class ChatService:
         tools = filter_deprecated(tools)
         if pre_count != len(tools):
             load_span.set_attribute("tools_filtered", pre_count - len(tools))
+        # The agent's own tools come last and are there even when MCP is not.
+        tools = [*tools, *self._web_tools]
 
         logger.debug(
             "chat_tools_loaded",

@@ -7,11 +7,14 @@ from pathlib import Path
 from limits import parse_many
 from limits.errors import ConfigurationError
 from limits.storage import storage_from_string
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Absolute, so .env is found whatever the process CWD; a missing .env is skipped.
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+
+# The web search backends integrations/web.py implements; `off` registers no web tools.
+WEB_SEARCH_PROVIDERS = ("duckduckgo", "searxng", "brave", "tavily", "off")
 
 
 class Settings(BaseSettings):
@@ -78,6 +81,31 @@ class Settings(BaseSettings):
 
     # One tool call's bound, on the call and on the session under it.
     mcp_tool_timeout_s: float = 30.0
+
+    # Web: the agent's own search and page read, built in (agent/web_tools.py), no MCP server.
+    # `off` (the default) registers no web tools; `searxng` needs web_search_url; `brave` and
+    # `tavily` need web_search_api_key; `duckduckgo` needs nothing but is refused a human check
+    # from most server networks, so it is a laptop option, not a deployment one.
+    web_search_provider: str = "off"
+    web_search_url: str = ""
+    web_search_api_key: str = ""
+    # One search or page fetch's bound; inside the tool-call bound, so a slow site is a result.
+    web_timeout_s: float = 10.0
+
+    @model_validator(mode="after")
+    def _validate_web(self) -> Settings:
+        if self.web_search_provider not in WEB_SEARCH_PROVIDERS:
+            raise ValueError(f"web_search_provider must be one of {WEB_SEARCH_PROVIDERS}")
+        if self.web_search_provider == "searxng" and not self.web_search_url:
+            raise ValueError("web_search_url is required when web_search_provider is searxng")
+        if self.web_search_provider in ("brave", "tavily") and not self.web_search_api_key:
+            raise ValueError(
+                "web_search_api_key is required when web_search_provider is "
+                + self.web_search_provider
+            )
+        if self.web_timeout_s <= 0:
+            raise ValueError("web_timeout_s must be positive")
+        return self
 
     # Each /health probe's httpx timeout, per operation. The two run at once, so a hung
     # dependency answers ok: False inside the 5 s rag allows the call (rag/rag/status.py).

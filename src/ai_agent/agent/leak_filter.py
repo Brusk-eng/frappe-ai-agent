@@ -31,6 +31,8 @@ _TOOL_NAMES = (
     "delete_document",
     "run_report",
     "get_doctype_meta",
+    "web_search",
+    "fetch_web_page",
 )
 
 

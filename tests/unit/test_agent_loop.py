@@ -579,3 +579,205 @@ class TestChatScope:
                 "attachment": True,
             }
         ]
+
+
+class TestAnnouncedWithoutCall:
+    """A reply that says "I will add X" and calls nothing is sent back once to make the call."""
+
+    @pytest.mark.asyncio
+    async def test_the_model_is_nudged_once_and_then_calls(self):
+        llm = _fake_llm_with_yields(
+            [
+                [
+                    {
+                        "blocks": [
+                            {"type": "text", "payload": {"content": "I will add Acme as a lead."}}
+                        ]
+                    }
+                ],
+                [
+                    {
+                        "blocks": [
+                            {"type": "text", "payload": {"content": "Adding Acme."}},
+                            {
+                                "type": "tool_call",
+                                "payload": {
+                                    "name": "create_document",
+                                    "arguments": {"doctype": "Lead"},
+                                },
+                            },
+                        ]
+                    }
+                ],
+                [{"blocks": [{"type": "text", "payload": {"content": "Done."}}]}],
+            ]
+        )
+        reg = _FakeRegistry({"create_document": "LEAD-0001"})
+        events = await _drain(run_agent_loop(llm=llm, tool_registry=reg, user_message="add acme"))
+        assert reg.calls == [("create_document", {"doctype": "Lead"})]
+        texts = [e["text"] for e in events if e["type"] == "content"]
+        assert texts[0] == "I will add Acme as a lead."
+        assert "Done." in "".join(texts)
+
+    @pytest.mark.asyncio
+    async def test_a_retraction_ends_the_turn(self):
+        # nudged once; a second narrating reply is not nudged again
+        llm = _fake_llm_with_yields(
+            [
+                [
+                    {
+                        "blocks": [
+                            {"type": "text", "payload": {"content": "I will create the record."}}
+                        ]
+                    }
+                ],
+                [{"blocks": [{"type": "text", "payload": {"content": "I will create it later."}}]}],
+            ]
+        )
+        reg = _FakeRegistry({"create_document": "x"})
+        events = await _drain(run_agent_loop(llm=llm, tool_registry=reg, user_message="go"))
+        assert reg.calls == []
+        assert [e["type"] for e in events].count("content") == 2
+
+    @pytest.mark.asyncio
+    async def test_plain_answers_are_not_nudged(self):
+        llm = _fake_llm_with_yields(
+            [[{"blocks": [{"type": "text", "payload": {"content": "You have 3 open invoices."}}]}]]
+        )
+        reg = _FakeRegistry({"list_documents": "[]"})
+        events = await _drain(run_agent_loop(llm=llm, tool_registry=reg, user_message="invoices?"))
+        assert [e["type"] for e in events] == ["content"]
+
+    def test_announcement_detector(self):
+        from ai_agent.agent.loop import announces_action
+
+        assert announces_action("I will add the following companies as leads: A, B.")
+        assert announces_action("I'll now create a Print Format for you.")
+        assert announces_action("Let me update the customer record.")
+        assert not announces_action("Here are the leads I found on the web.")
+        assert not announces_action("I will look that up.")
+        assert not announces_action("The record was created: LEAD-0001.")
+
+
+class TestWriteFieldCheck:
+    """A create naming a field its doctype lacks goes back to the model, not to the user."""
+
+    _META = (
+        'Retrieved DocType document: Lead\n{"name": "Lead", "fields": ['
+        '{"fieldname": "company_name", "fieldtype": "Data"},'
+        '{"fieldname": "lead_name", "fieldtype": "Data"}]}'
+    )
+
+    class _Reg(_FakeRegistry):
+        def writes(self, name: str) -> bool:
+            return name == "create_document"
+
+    @staticmethod
+    def _create(data: dict[str, Any]) -> dict[str, Any]:
+        call = {"name": "create_document", "arguments": {"doctype": "Lead", "data": data}}
+        return {
+            "blocks": [
+                {"type": "text", "payload": {"content": "Adding it."}},
+                {"type": "tool_call", "payload": call},
+            ]
+        }
+
+    @pytest.mark.asyncio
+    async def test_bad_field_is_corrected_and_only_the_good_call_asks_the_user(self):
+        llm = _fake_llm_with_yields(
+            [[self._create({"organization": "Acme"})], [self._create({"company_name": "Acme"})]]
+        )
+        reg = self._Reg({"get_document": self._META, "create_document": "x"})
+        events = await _drain(run_agent_loop(llm=llm, tool_registry=reg, user_message="add"))
+        confirms = [e for e in events if e["type"] == "tool_confirm"]
+        assert len(confirms) == 1
+        assert confirms[0]["arguments"]["data"] == {"company_name": "Acme"}
+        assert (
+            "create_document",
+            {"doctype": "Lead", "data": {"organization": "Acme"}},
+        ) not in reg.calls
+
+    @pytest.mark.asyncio
+    async def test_the_model_is_told_the_fields_that_exist(self):
+        seen: list[Any] = []
+        iterations = [
+            [self._create({"organization": "Acme"})],
+            [self._create({"company_name": "A"})],
+        ]
+        llm = _fake_llm_with_yields(iterations)
+        structured = llm.with_structured_output.return_value
+        original = structured.astream
+        structured.astream = lambda messages, config=None: (
+            seen.append(list(messages)),
+            original(messages, config),
+        )[1]
+        reg = self._Reg({"get_document": self._META, "create_document": "x"})
+        await _drain(run_agent_loop(llm=llm, tool_registry=reg, user_message="add"))
+        assert "no field named 'organization'" in str(seen[1][-1].content)
+        assert "company_name" in str(seen[1][-1].content)
+
+    @pytest.mark.asyncio
+    async def test_correction_is_capped_so_a_stubborn_model_still_reaches_the_user(self):
+        bad = self._create({"organization": "Acme"})
+        llm = _fake_llm_with_yields([[bad]] * 5)
+        reg = self._Reg({"get_document": self._META, "create_document": "x"})
+        events = await _drain(run_agent_loop(llm=llm, tool_registry=reg, user_message="add"))
+        assert [e["type"] for e in events].count("tool_confirm") == 1
+
+
+class TestWriteProvenance:
+    """An address the model did not read is sent back; one it read goes to the user."""
+
+    class _Reg(_FakeRegistry):
+        def writes(self, name: str) -> bool:
+            return name == "create_document"
+
+    @staticmethod
+    def _call(name: str, args: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "blocks": [
+                {"type": "text", "payload": {"content": "Working."}},
+                {"type": "tool_call", "payload": {"name": name, "arguments": args}},
+            ]
+        }
+
+    @pytest.mark.asyncio
+    async def test_invented_website_is_sent_back_then_read_then_allowed(self):
+        make = lambda site: self._call(  # noqa: E731
+            "create_document",
+            {"doctype": "Lead", "data": {"lead_name": "Examplia", "website": site}},
+        )
+        llm = _fake_llm_with_yields(
+            [
+                [make("https://examplia.test")],
+                [self._call("fetch_web_page", {"url": "https://directory.test/p/examplia"})],
+                [make("https://www.examplia-systems.test")],
+            ]
+        )
+        reg = self._Reg(
+            {
+                "fetch_web_page": "Examplia\nView website (https://www.examplia-systems.test)",
+                "create_document": "x",
+            }
+        )
+        events = await _drain(
+            run_agent_loop(llm=llm, tool_registry=reg, user_message="add examplia")
+        )
+        confirms = [e for e in events if e["type"] == "tool_confirm"]
+        assert len(confirms) == 1
+        assert confirms[0]["arguments"]["data"]["website"] == "https://www.examplia-systems.test"
+        assert [c[0] for c in reg.calls] == ["fetch_web_page"]
+
+    @pytest.mark.asyncio
+    async def test_an_address_the_user_typed_is_theirs_to_give(self):
+        data = {"lead_name": "Acme", "website": "https://acme.test"}
+        llm = _fake_llm_with_yields(
+            [[self._call("create_document", {"doctype": "Lead", "data": data})]]
+        )
+        reg = self._Reg({"create_document": "x"})
+        events = await _drain(
+            run_agent_loop(
+                llm=llm, tool_registry=reg, user_message="add Acme, site https://acme.test"
+            )
+        )
+        assert [e["type"] for e in events].count("tool_confirm") == 1

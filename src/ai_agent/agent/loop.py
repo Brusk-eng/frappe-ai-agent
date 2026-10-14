@@ -20,7 +20,13 @@ if TYPE_CHECKING:
 
     from ai_agent.agent.tool_registry import ToolRegistry
 
+from ai_agent.agent.condense import (
+    check_write_data,
+    condense_tool_result,
+    unsupported_values,
+)
 from ai_agent.agent.tool_registry import AGENT_ARGS
+from ai_agent.agent.web_tools import WEB_SEARCH_TOOL
 from ai_agent.blocks.envelope import (
     TOOL_CALL_TYPE,
     block_envelope_schema,
@@ -38,6 +44,8 @@ logger = structlog.get_logger(__name__)
 _REPEAT_LIMIT = 3
 
 KB_TOOL = "search_knowledge_base"
+# The tools whose results carry passages the answer can cite: `sources` events come from these.
+SOURCE_TOOLS = frozenset({KB_TOOL, WEB_SEARCH_TOOL})
 
 
 def cap_for_prompt(text: str, limit: int) -> str:
@@ -59,6 +67,27 @@ def _as_data(results: str) -> str:
 
 
 REPLY_CUT_OFF = "The answer was cut short. Try a narrower question."
+
+# A final reply that promises a change it did not make: "I will add X", "I'll now create Y".
+# The model is sent back once to make the call; without this, a model that narrates instead
+# of acting ends every turn as a chatbot would.
+_ANNOUNCES_ACTION = re.compile(
+    r"\b(I will|I'll|I am going to|I'm going to|let me|I will now|proceeding to|proceed to)\b"
+    r"[^.\n]{0,80}\b(create|creat(e|ing)|add(ing)?|update|updat(e|ing)|change|changing|"
+    r"delete|deleting|remove|removing|submit|submitting|record|save|saving)\b",
+    re.IGNORECASE,
+)
+_NUDGE = (
+    "You announced a change but your reply held no tool_call block, so nothing was done. "
+    "Make the call now: one tool_call block for the first change, with a short text block "
+    "beside it. If you have decided not to change anything, say so plainly instead."
+)
+
+
+def announces_action(text: str) -> bool:
+    """Whether `text` promises a write in the first person without having made one."""
+    return bool(_ANNOUNCES_ACTION.search(text))
+
 
 # What the user is asked to allow, per write tool: a template and the arguments it needs.
 # The agent composes the sentence so nothing the model wrote reaches the confirmation card.
@@ -167,6 +196,7 @@ async def _run_tools(
     *,
     session: str | None,
     result_max_chars: int,
+    evidence: list[str],
 ) -> AsyncGenerator[dict[str, Any], None]:
     """Announce and run the envelope's calls, then put the attempt and its results in `messages`."""
     for name, args in map(_call, tool_blocks):
@@ -179,11 +209,13 @@ async def _run_tools(
         args = {k: v for k, v in args.items() if k not in AGENT_ARGS.get(name, ())}
         if name == KB_TOOL and session:
             args["session"] = session
-        result = await tool_registry.ainvoke(name, args)
+        result = condense_tool_result(name, args, await tool_registry.ainvoke(name, args))
         # the sources come out of the whole result; only the prompt's copy is capped
-        if name == KB_TOOL and (items := _passages(result)):
+        if name in SOURCE_TOOLS and (items := _passages(result)):
             yield {"type": "sources", "items": items}
-        result_lines.append(_result_line(name, args, cap_for_prompt(result, result_max_chars)))
+        shown = cap_for_prompt(result, result_max_chars)
+        evidence.append(shown)  # what the model saw, so what it may write
+        result_lines.append(_result_line(name, args, shown))
 
     # Replay the model's tool_call envelope as an AIMessage so the
     # context shows what was attempted; then feed back the results.
@@ -220,6 +252,10 @@ async def run_agent_loop(
 
     reply = _Reply()
     repeats = _RepeatGuard()
+    nudged = False  # one reminder per turn, for a reply that promised a change and made none
+    corrections = 0  # writes sent back for fields their doctype lacks or values it never read
+    # Everything the model has read this turn, kept to check what it writes against.
+    evidence: list[str] = [user_message, *(str(m.content) for m in history or [])]
 
     if confirmed is not None:
         # The user clicked Allow, so this call runs once, before the model gets a turn.
@@ -233,6 +269,7 @@ async def run_agent_loop(
                 )
             )
         )
+        evidence.append(result)
         messages.append(HumanMessage(content=_as_data(_result_line(name, args, result))))
 
     for step in range(max_steps):
@@ -295,6 +332,18 @@ async def run_agent_loop(
             # Final iteration: send what the stream has not sent yet.
             for ev in reply.flush(final=True):
                 yield ev
+            if (
+                not nudged
+                and tool_registry.names()
+                and step + 1 < max_steps
+                and announces_action(_text_of(non_tool_blocks))
+            ):
+                # The text has gone out; what follows is the call it promised, or a retraction.
+                nudged = True
+                logger.info("agent_loop_announced_without_call", step=step)
+                messages.append(AIMessage(content=json.dumps(reply.envelope, ensure_ascii=False)))
+                messages.append(HumanMessage(content=_NUDGE))
+                continue
             if not reply.emitted_any:
                 # All non-tool blocks were malformed and dropped by
                 # parse_blocks / envelope_to_markup. Surface a fallback.
@@ -319,6 +368,24 @@ async def run_agent_loop(
         pending = _pending_write(tool_blocks, tool_registry)
         if pending is not None:
             name, args = pending
+            problem = (
+                await _write_problem(name, args, tool_registry, evidence)
+                if corrections < _MAX_CORRECTIONS
+                else None
+            )
+            if problem is not None:
+                # Not worth the user's click: the write would fail. Tell the model what is wrong
+                # and let it call again; the user is only asked about a call that can succeed.
+                corrections += 1
+                logger.info("agent_loop_write_corrected", tool=name, step=step)
+                messages.append(AIMessage(content=json.dumps(reply.envelope, ensure_ascii=False)))
+                messages.append(
+                    HumanMessage(
+                        content=_as_data(f"tool {name} was not run: {problem}")
+                        + "\nMake the call again, corrected."
+                    )
+                )
+                continue
             sentence = confirm_summary(name, args)
             logger.info("agent_loop_write_needs_confirmation", tool=name, step=step)
             yield {"type": "content", "text": f"\n\n{sentence}" if reply.spoke else sentence}
@@ -349,6 +416,7 @@ async def run_agent_loop(
                 tool_registry,
                 session=session,
                 result_max_chars=tool_result_max_chars,
+                evidence=evidence,
             )
         ) as running:
             async for ev in running:
@@ -363,6 +431,42 @@ async def run_agent_loop(
             "Try a more specific question."
         ),
     }
+
+
+_MAX_CORRECTIONS = 3
+_FIELD_CHECKED = frozenset({"create_document", "update_document"})
+
+
+async def _write_problem(
+    name: str, args: dict[str, Any], registry: ToolRegistry, evidence: list[str]
+) -> str | None:
+    """What is wrong with a write before the user is asked: unknown fields, or an unread address."""
+    doctype = args.get("doctype")
+    if name not in _FIELD_CHECKED or not isinstance(doctype, str) or not doctype:
+        return None
+    problems: list[str] = []
+    if "get_document" in registry.names():
+        meta = await registry.ainvoke("get_document", {"doctype": "DocType", "name": doctype})
+        # a definition that could not be read checks nothing; the write will say what it says
+        if not meta.startswith(("Tool call failed", "Access denied", "error:")):
+            if bad_fields := check_write_data(meta, doctype, args.get("data")):
+                problems.append(bad_fields)
+    for field, value in unsupported_values(args.get("data"), "\n".join(evidence)):
+        problems.append(
+            f"{field} is {value!r}, which appears in nothing you have read: an address or an "
+            "email cannot be worked out, only read. Fetch the page that shows it (a listing "
+            "usually links each entry to a page of its own), or leave the field out."
+        )
+    return " ".join(problems) or None
+
+
+def _text_of(blocks: list[dict[str, Any]]) -> str:
+    """The text blocks' content, joined."""
+    return "\n".join(
+        str((b.get("payload") or {}).get("content") or "")
+        for b in blocks
+        if b.get("type") == "text"
+    )
 
 
 def _is_tool_call(block: Any) -> bool:

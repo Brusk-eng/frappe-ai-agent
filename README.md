@@ -175,6 +175,10 @@ there is silent — check the resolved values on `GET /config`.
 | `AI_AGENT_MCP_SERVER_URL` | `http://localhost:8080/mcp` | MCP Streamable HTTP endpoint |
 | `AI_AGENT_MCP_TOOLS_LOAD_TIMEOUT_S` | `20.0` | Per-request bound on `tools/list`. A timeout becomes a single SSE `error` event, not a hung stream |
 | `AI_AGENT_MCP_TOOL_TIMEOUT_S` | `30.0` | Bound on one tool call, and on the HTTP and SSE read timeouts of the MCP session under it. A timeout comes back as a tool result the model can answer around |
+| `AI_AGENT_WEB_SEARCH_PROVIDER` | `off` | The backend of the agent's built-in `web_search` tool: `searxng` (self-hosted, needs `AI_AGENT_WEB_SEARCH_URL`), `brave` or `tavily` (need `AI_AGENT_WEB_SEARCH_API_KEY`), `duckduckgo` (no key, laptop use only), or `off` to register no web tools. See "Web search" |
+| `AI_AGENT_WEB_SEARCH_URL` | _empty_ | Base URL of the SearXNG instance, for the `searxng` provider |
+| `AI_AGENT_WEB_SEARCH_API_KEY` | _empty_ | API key for the `brave` and `tavily` providers |
+| `AI_AGENT_WEB_TIMEOUT_S` | `10.0` | Bound on one web search or page fetch, inside the tool-call bound |
 | `AI_AGENT_HEALTH_PROBE_TIMEOUT_S` | `5.0` | Timeout on the agent's own `/health` reachability pings against MCP and Ollama |
 | `AI_AGENT_FRAPPE_URL` | `http://localhost:8000` | Frappe URL for chat history writes |
 | `AI_AGENT_FRAPPE_SITE_ROUTES_FILE` | _empty_ | Optional path to YAML file mapping tenant site names to Frappe bench URLs |
@@ -226,6 +230,34 @@ question is still answered and a data question comes back as "I can't fetch that
 rather than as invented numbers.
 
 `ToolRegistry.ainvoke` catches every tool exception (MCP errors, Frappe permission denials, httpx timeouts) and surfaces it to the LLM as a string observation rather than aborting the loop. Permission errors get a clearer prefix (`Access denied: permission error — …`).
+
+## Web search
+
+The agent carries two tools of its own beside what the MCP server offers: `web_search` and
+`fetch_web_page`. They are plain LangChain tools built in this process
+(`src/ai_agent/agent/web_tools.py`, over `src/ai_agent/integrations/web.py`), so the assistant
+can look something up outside the database without another MCP server being deployed. Both
+are declared read-only, so the write confirmation never pauses on them, and both are there
+even on a turn where `tools/list` failed.
+
+`web_search` returns up to five results as a JSON list of `{seq, file, file_name, content}`,
+the same shape as a knowledge-base passage, so the agent loop reports them in a `sources`
+event. `fetch_web_page` reads one page as plain text, cut to `AI_AGENT_AGENT_PROMPT_TEXT_MAX_CHARS`.
+
+The backend is `AI_AGENT_WEB_SEARCH_PROVIDER`:
+
+| Provider | Needs | Notes |
+| --- | --- | --- |
+| `off` | — | The default: no web tools are registered, and the assistant answers from the database alone |
+| `searxng` | `AI_AGENT_WEB_SEARCH_URL` | A self-hosted [SearXNG](https://docs.searxng.org/) with `json` in `search.formats`; the vendor-neutral choice, and what the suite's `compose.yaml` runs beside the agent |
+| `brave` | `AI_AGENT_WEB_SEARCH_API_KEY` | Brave Search API |
+| `tavily` | `AI_AGENT_WEB_SEARCH_API_KEY` | Tavily |
+| `duckduckgo` | nothing | DuckDuckGo's HTML endpoint, parsed here. From most server networks DuckDuckGo answers with a human check instead of results; the tool then fails with a line naming the fix. Fine on a laptop, not for a deployment |
+
+A missing URL or key for the chosen provider fails startup. `fetch_web_page` resolves the host
+itself and refuses private, loopback, link-local and `.localhost` addresses on every redirect
+hop, so a model cannot be steered into reading the MCP server, Redis or a cloud metadata
+endpoint; it also refuses anything but http(s) and anything that is not text or HTML.
 
 ## Multi-turn state
 

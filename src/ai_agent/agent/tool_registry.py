@@ -26,9 +26,10 @@ def _is_permission_error(exc: Exception) -> bool:
         phrase in text
         for phrase in (
             "permission denied",
-            "not permitted",
             "forbidden",
             "does not have permission",
+            "insufficient permission",
+            "no permission for",
             "not authorized",
             "unauthorized",
         )
