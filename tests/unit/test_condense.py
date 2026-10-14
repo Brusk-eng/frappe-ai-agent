@@ -69,8 +69,9 @@ class TestCondenseDoctype:
         assert "- company_name | Organization Name | Data |" in out
         assert "- country | Country | Link | | Country" in out
         assert (
-            "- status | Status | Select | required, fills itself | Lead, Open, Replied, Opportunity, Quotation, "
-            "Lost Quotation, Interested, Converted, … (9 values); default Lead"
+            "- status | Status | Select | required, fills itself | Lead, Open, Replied, "
+            "Opportunity, Quotation, Lost Quotation, Interested, Converted, … (9 values); "
+            "default Lead"
         ) in out
         assert "- email_id | Email | Data | unique" in out
         assert "- notes | Notes | Table | | CRM Note" in out
