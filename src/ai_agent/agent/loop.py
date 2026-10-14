@@ -223,6 +223,97 @@ async def _run_tools(
     messages.append(HumanMessage(content=_as_data("\n".join(result_lines))))
 
 
+def _replay(messages: list[BaseMessage], envelope: dict[str, Any], note: str) -> None:
+    """Put the model's own reply and a note about it in the conversation, for its next step."""
+    messages.append(AIMessage(content=json.dumps(envelope, ensure_ascii=False)))
+    messages.append(HumanMessage(content=note))
+
+
+def _wants_nudge(
+    *, nudged: bool, registry: ToolRegistry, step: int, max_steps: int, text: str
+) -> bool:
+    """A final reply that promises a change and made no call, with a step left to make it."""
+    return not nudged and bool(registry.names()) and step + 1 < max_steps and announces_action(text)
+
+
+async def _write_correction(
+    name: str,
+    args: dict[str, Any],
+    registry: ToolRegistry,
+    evidence: list[str],
+    corrections: int,
+) -> str | None:
+    """What to tell the model about a write that would fail, until the budget of tries is spent."""
+    if corrections >= _MAX_CORRECTIONS:
+        return None
+    return await _write_problem(name, args, registry, evidence)
+
+
+def _unrenderable_events(
+    reply: _Reply, non_tool_blocks: list[dict[str, Any]], step: int
+) -> list[dict[str, Any]]:
+    """The fallback line when every block the model wrote was dropped as malformed."""
+    if reply.emitted_any:
+        return []
+    logger.warning(
+        "agent_loop_no_emittable_blocks",
+        step=step,
+        block_types=[b.get("type") for b in non_tool_blocks],
+    )
+    return [{"type": "content", "text": "I produced a response but it couldn't be rendered."}]
+
+
+async def _run_confirmed(
+    confirmed: dict[str, Any],
+    messages: list[BaseMessage],
+    registry: ToolRegistry,
+    evidence: list[str],
+    max_chars: int,
+) -> AsyncGenerator[dict[str, Any], None]:
+    """The write the user allowed: announced, run once, and put in the conversation as done."""
+    name, args = _name_and_args(confirmed)
+    yield {"type": "tool_call", "name": name, "arguments": args}
+    result = cap_for_prompt(await registry.ainvoke(name, args), max_chars)
+    call = {"blocks": [{"type": TOOL_CALL_TYPE, "payload": confirmed}]}
+    evidence.append(result)
+    _replay(messages, call, _as_data(_result_line(name, args, result)))
+
+
+async def _stream_step(
+    *,
+    reply: _Reply,
+    structured_llm: Any,
+    llm: BaseChatModel,
+    messages: list[BaseMessage],
+    callbacks: list[BaseCallbackHandler],
+    step: int,
+) -> AsyncGenerator[dict[str, Any], None]:
+    """One model reply, streamed; a provider error is logged and re-raised, a cut-off one fails."""
+    stop = _StopReason()
+    try:
+        # aclosing, because `async for` does not close what it iterates: without it the
+        # provider's open response outlives the turn a client stopped.
+        async with aclosing(reply.stream(structured_llm, messages, [*callbacks, stop])) as replied:
+            async for ev in replied:
+                yield ev
+    except Exception as exc:
+        llm_endpoint, llm_model = _llm_identity(llm)
+        logger.warning(
+            "agent_loop_llm_error",
+            step=step,
+            error_type=type(exc).__name__,
+            error=str(exc)[:300],
+            llm_endpoint=llm_endpoint,
+            llm_model=llm_model,
+        )
+        raise
+    if stop.cut_off:
+        # The envelope stops wherever the tokens ran out, so its last block — a tool call's
+        # arguments, a number, a sentence — is whatever had been written by then.
+        logger.warning("agent_loop_reply_cut_off", step=step)
+        raise TurnFailure(REPLY_CUT_OFF)
+
+
 async def run_agent_loop(
     *,
     llm: BaseChatModel,
@@ -259,49 +350,24 @@ async def run_agent_loop(
 
     if confirmed is not None:
         # The user clicked Allow, so this call runs once, before the model gets a turn.
-        name, args = _name_and_args(confirmed)
-        yield {"type": "tool_call", "name": name, "arguments": args}
-        result = cap_for_prompt(await tool_registry.ainvoke(name, args), tool_result_max_chars)
-        messages.append(
-            AIMessage(
-                content=json.dumps(
-                    {"blocks": [{"type": TOOL_CALL_TYPE, "payload": confirmed}]}, ensure_ascii=False
-                )
-            )
-        )
-        evidence.append(result)
-        messages.append(HumanMessage(content=_as_data(_result_line(name, args, result))))
+        async for ev in _run_confirmed(
+            confirmed, messages, tool_registry, evidence, tool_result_max_chars
+        ):
+            yield ev
 
     for step in range(max_steps):
         # Each snapshot holds the whole envelope so far. Text goes out as it grows while no
         # tool_call has appeared; text written before a tool_call stays as a preamble. At
         # stream end we decide whether it was a tool-calling iteration or the final one.
-        stop = _StopReason()
-        try:
-            # aclosing, because `async for` does not close what it iterates: without it the
-            # provider's open response outlives the turn a client stopped.
-            async with aclosing(
-                reply.stream(structured_llm, messages, [*(callbacks or []), stop])
-            ) as replied:
-                async for ev in replied:
-                    yield ev
-        except Exception as exc:
-            llm_endpoint, llm_model = _llm_identity(llm)
-            logger.warning(
-                "agent_loop_llm_error",
-                step=step,
-                error_type=type(exc).__name__,
-                error=str(exc)[:300],
-                llm_endpoint=llm_endpoint,
-                llm_model=llm_model,
-            )
-            raise
-
-        if stop.cut_off:
-            # The envelope stops wherever the tokens ran out, so its last block — a tool call's
-            # arguments, a number, a sentence — is whatever had been written by then.
-            logger.warning("agent_loop_reply_cut_off", step=step)
-            raise TurnFailure(REPLY_CUT_OFF)
+        async for ev in _stream_step(
+            reply=reply,
+            structured_llm=structured_llm,
+            llm=llm,
+            messages=messages,
+            callbacks=callbacks or [],
+            step=step,
+        ):
+            yield ev
 
         blocks, tool_blocks, non_tool_blocks = _split_blocks(reply.envelope)
 
@@ -332,30 +398,20 @@ async def run_agent_loop(
             # Final iteration: send what the stream has not sent yet.
             for ev in reply.flush(final=True):
                 yield ev
-            if (
-                not nudged
-                and tool_registry.names()
-                and step + 1 < max_steps
-                and announces_action(_text_of(non_tool_blocks))
+            if _wants_nudge(
+                nudged=nudged,
+                registry=tool_registry,
+                step=step,
+                max_steps=max_steps,
+                text=_text_of(non_tool_blocks),
             ):
                 # The text has gone out; what follows is the call it promised, or a retraction.
                 nudged = True
                 logger.info("agent_loop_announced_without_call", step=step)
-                messages.append(AIMessage(content=json.dumps(reply.envelope, ensure_ascii=False)))
-                messages.append(HumanMessage(content=_NUDGE))
+                _replay(messages, reply.envelope, _NUDGE)
                 continue
-            if not reply.emitted_any:
-                # All non-tool blocks were malformed and dropped by
-                # parse_blocks / envelope_to_markup. Surface a fallback.
-                logger.warning(
-                    "agent_loop_no_emittable_blocks",
-                    step=step,
-                    block_types=[b.get("type") for b in non_tool_blocks],
-                )
-                yield {
-                    "type": "content",
-                    "text": "I produced a response but it couldn't be rendered.",
-                }
+            for ev in _unrenderable_events(reply, non_tool_blocks, step):
+                yield ev
             return
 
         # Tool-calling iteration. The envelope is replayed to the model below as if the user saw all
@@ -368,23 +424,14 @@ async def run_agent_loop(
         pending = _pending_write(tool_blocks, tool_registry)
         if pending is not None:
             name, args = pending
-            problem = (
-                await _write_problem(name, args, tool_registry, evidence)
-                if corrections < _MAX_CORRECTIONS
-                else None
-            )
+            problem = await _write_correction(name, args, tool_registry, evidence, corrections)
             if problem is not None:
                 # Not worth the user's click: the write would fail. Tell the model what is wrong
                 # and let it call again; the user is only asked about a call that can succeed.
                 corrections += 1
                 logger.info("agent_loop_write_corrected", tool=name, step=step)
-                messages.append(AIMessage(content=json.dumps(reply.envelope, ensure_ascii=False)))
-                messages.append(
-                    HumanMessage(
-                        content=_as_data(f"tool {name} was not run: {problem}")
-                        + "\nMake the call again, corrected."
-                    )
-                )
+                note = _as_data(f"tool {name} was not run: {problem}")
+                _replay(messages, reply.envelope, note + "\nMake the call again, corrected.")
                 continue
             sentence = confirm_summary(name, args)
             logger.info("agent_loop_write_needs_confirmation", tool=name, step=step)

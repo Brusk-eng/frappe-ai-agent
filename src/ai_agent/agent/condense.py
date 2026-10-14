@@ -30,66 +30,81 @@ def condense_tool_result(name: str, args: dict[str, Any], result: str) -> str:
 
 def condense_doctype(result: str) -> str:
     """A DocType document as one line per data field: name, label, type, flags, options."""
-    start = result.find("{")
-    if start < 0:
+    doc = _doctype_document(result)
+    if doc is None:
         return result
-    try:
-        doc = json.loads(result[start:])
-    except ValueError:
-        return result
-    if not isinstance(doc, dict) or not isinstance(doc.get("fields"), list):
-        return result
-
-    name = str(doc.get("name") or "")
-    lines = [f"DocType {name}" + (f": {doc['description']}" if doc.get("description") else "")]
-    naming = doc.get("autoname") or "hash"
-    lines.append(
-        f"naming: {naming}"
-        + (f"; title field: {doc['title_field']}" if doc.get("title_field") else "")
-        + ("; submittable" if doc.get("is_submittable") else "")
-        + ("; child table" if doc.get("istable") else "")
-    )
-    required: list[str] = []
+    lines = _header_lines(doc)
     lines.append("fields (fieldname | label | type | flags | options):")
+    required: list[str] = []
     for f in doc["fields"]:
-        if not isinstance(f, dict):
+        if not _is_data_field(f):
             continue
-        fieldtype = str(f.get("fieldtype") or "")
-        fieldname = str(f.get("fieldname") or "")
-        if not fieldname or fieldtype in _LAYOUT_TYPES or f.get("hidden"):
-            continue
-        flags = []
         if f.get("reqd"):
-            flags.append("required")
-            required.append(fieldname)
-        if f.get("read_only"):
-            flags.append("read-only")
-        if f.get("unique"):
-            flags.append("unique")
-        if f.get("fetch_from"):
-            flags.append(f"fetched from {f['fetch_from']}")
-        options = ""
-        if fieldtype in _WITH_OPTIONS and f.get("options"):
-            raw = str(f["options"])
-            if fieldtype == "Select":
-                values = [v for v in raw.split("\n") if v.strip()]
-                shown = ", ".join(values[:_SELECT_SHOWN])
-                options = shown + (
-                    f", … ({len(values)} values)" if len(values) > _SELECT_SHOWN else ""
-                )
-            elif fieldtype == "Dynamic Link":
-                options = f"doctype named in {raw}"
-            else:
-                options = raw
-        if f.get("default") not in (None, ""):
-            options = (options + "; " if options else "") + f"default {f['default']}"
-        lines.append(
-            f"- {fieldname} | {f.get('label') or ''} | {fieldtype}"
-            + (f" | {', '.join(flags)}" if flags else " |")
-            + (f" | {options}" if options else "")
-        )
+            required.append(str(f["fieldname"]))
+        lines.append(_field_line(f))
     lines.append("required: " + (", ".join(required) if required else "none"))
     return "\n".join(lines)
+
+
+def _header_lines(doc: dict[str, Any]) -> list[str]:
+    title = f"DocType {doc.get('name') or ''}"
+    if doc.get("description"):
+        title += f": {doc['description']}"
+    traits = f"naming: {doc.get('autoname') or 'hash'}"
+    if doc.get("title_field"):
+        traits += f"; title field: {doc['title_field']}"
+    if doc.get("is_submittable"):
+        traits += "; submittable"
+    if doc.get("istable"):
+        traits += "; child table"
+    return [title, traits]
+
+
+def _is_data_field(f: Any) -> bool:
+    """A field that holds data: not a layout break, not hidden, and named."""
+    return (
+        isinstance(f, dict)
+        and bool(f.get("fieldname"))
+        and str(f.get("fieldtype") or "") not in _LAYOUT_TYPES
+        and not f.get("hidden")
+    )
+
+
+def _field_flags(f: dict[str, Any]) -> list[str]:
+    flags = []
+    for key, label in (("reqd", "required"), ("read_only", "read-only"), ("unique", "unique")):
+        if f.get(key):
+            flags.append(label)
+    if f.get("fetch_from"):
+        flags.append(f"fetched from {f['fetch_from']}")
+    return flags
+
+
+def _field_options(f: dict[str, Any]) -> str:
+    fieldtype = str(f.get("fieldtype") or "")
+    options = ""
+    if fieldtype in _WITH_OPTIONS and f.get("options"):
+        raw = str(f["options"])
+        if fieldtype == "Select":
+            values = [v for v in raw.split("\n") if v.strip()]
+            options = ", ".join(values[:_SELECT_SHOWN])
+            if len(values) > _SELECT_SHOWN:
+                options += f", \u2026 ({len(values)} values)"
+        elif fieldtype == "Dynamic Link":
+            options = f"doctype named in {raw}"
+        else:
+            options = raw
+    if f.get("default") not in (None, ""):
+        options = (options + "; " if options else "") + f"default {f['default']}"
+    return options
+
+
+def _field_line(f: dict[str, Any]) -> str:
+    flags = _field_flags(f)
+    options = _field_options(f)
+    line = f"- {f['fieldname']} | {f.get('label') or ''} | {f.get('fieldtype') or ''}"
+    line += f" | {', '.join(flags)}" if flags else " |"
+    return line + (f" | {options}" if options else "")
 
 
 # What every document has whatever its definition says.
