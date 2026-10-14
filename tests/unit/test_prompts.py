@@ -31,6 +31,12 @@ class TestBuildSystemPrompt:
         prompt = build_system_prompt({})
         assert "no prior knowledge of this database" in prompt
 
+    def test_missing_doctype_stops_writes(self):
+        # A site without the app that owns a DocType (Project on a CRM-only site) met the 404 on
+        # its DocType lookup by trying create_document anyway, which failed with a server error.
+        prompt = build_system_prompt({})
+        assert "DocType does not exist, it is not installed" in " ".join(prompt.split())
+
     def test_discovery_before_mutation_pattern_present(self):
         prompt = build_system_prompt({})
         # The discovery-before-mutation rule must be in the prompt so the LLM

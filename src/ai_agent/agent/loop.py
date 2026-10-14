@@ -621,6 +621,8 @@ async def _agent_turn(
 
 
 _MAX_CORRECTIONS = 4
+# Frappe's answer to a read of a record that does not exist, as the MCP server passes it on.
+_NOT_FOUND = "DoesNotExistError"
 _FIELD_CHECKED = frozenset({"create_document", BATCH_TOOL, "update_document"})
 
 
@@ -638,6 +640,12 @@ async def _write_problem(
     meta = ""
     if "get_document" in registry.names():
         meta = await registry.ainvoke("get_document", {"doctype": "DocType", "name": doctype})
+        if meta.startswith("Tool call failed") and _NOT_FOUND in meta:
+            return (
+                f"there is no DocType {doctype!r}: it is not installed on this site, so no "
+                "record of it can be made or changed. Make no write; tell the user it is missing "
+                "and which Frappe app usually provides it, if you know."
+            )
         # a definition that could not be read checks nothing; the write will say what it says
         if meta.startswith(("Tool call failed", "Access denied", "error:")):
             meta = ""

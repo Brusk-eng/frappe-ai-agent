@@ -725,6 +725,48 @@ class TestWriteFieldCheck:
         assert [e["type"] for e in events].count("tool_confirm") == 1
 
 
+class TestWriteToMissingDocType:
+    """A write to a DocType the site does not have goes back to the model, never to the user."""
+
+    _MISSING = (
+        "Tool call failed: failed to get document DocType/Project: Resource not found (HTTP 404). "
+        "DoesNotExistError"
+    )
+
+    class _Reg(_FakeRegistry):
+        def writes(self, name: str) -> bool:
+            return name == "create_document"
+
+    @staticmethod
+    def _create() -> dict[str, Any]:
+        call = {
+            "name": "create_document",
+            "arguments": {"doctype": "Project", "data": {"project_name": "Home build"}},
+        }
+        return {
+            "blocks": [
+                {"type": "text", "payload": {"content": "Adding it."}},
+                {"type": "tool_call", "payload": call},
+            ]
+        }
+
+    @pytest.mark.asyncio
+    async def test_missing_doctype_is_sent_back_and_the_model_says_so(self):
+        seen: list[Any] = []
+        answer = {"blocks": [{"type": "text", "payload": {"content": "Project is not here."}}]}
+        llm = _fake_llm_with_yields([[self._create()], [answer]])
+        structured = llm.with_structured_output.return_value
+        original = structured.astream
+        structured.astream = lambda messages, config=None: (
+            seen.append(list(messages)),
+            original(messages, config),
+        )[1]
+        reg = self._Reg({"get_document": self._MISSING, "create_document": "x"})
+        events = await _drain(run_agent_loop(llm=llm, tool_registry=reg, user_message="add"))
+        assert not [e for e in events if e["type"] == "tool_confirm"]
+        assert "not installed on this site" in str(seen[1][-1].content)
+
+
 class TestWriteProvenance:
     """An address the model did not read is sent back; one it read goes to the user."""
 
