@@ -2,6 +2,7 @@
 name: print-format
 description: Create and edit custom Jinja print formats for Frappe DocTypes with verified fields and child table loops.
 risk: writes
+governs: Print Format
 ---
 
 <!-- records:
@@ -86,5 +87,5 @@ Do not use any other tools for this task.
 
 1. User requests: "Create a modern print format for Quotation called Quotation Modern".
 2. Assistant calls `get_document(doctype="DocType", name="Quotation")` to discover field names (`party_name`, `transaction_date`, `valid_till`, `items`).
-3. Assistant checks `list_documents(doctype="Print Format", filters=[["name", "=", "Quotation Modern"]])`.
-4. Assistant prepares the Jinja template and calls `create_document` with `doctype="Print Format"`, `doc_type="Quotation"`, `custom_format=1`, `print_format_type="Jinja"`.
+3. Assistant checks `list_documents(doctype="Print Format", filters={"name": "Quotation Modern"})`.
+4. Assistant prepares the Jinja template and calls `create_document` with `doctype="Print Format"` and a `data` object holding `name`, `doc_type="Quotation"`, `standard="No"`, `custom_format=1`, `print_format_type="Jinja"` and the template in `html`.

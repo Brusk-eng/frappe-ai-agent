@@ -2,6 +2,7 @@
 name: letter-head
 description: Design and configure HTML letter heads and footers for PDF documents with verified styling and default rules.
 risk: writes
+governs: Letter Head
 ---
 
 <!-- records:
@@ -31,7 +32,7 @@ Do not use raw file system tools or execute scripts.
 
 1. **HTML Source Mode**: Set `source: "HTML"` and `footer_source: "HTML"`. Use clean, inline-styled semantic HTML suitable for wkhtmltopdf.
 2. **No Invented Image Addresses**: Never invent or hallucinate logo image URLs (e.g. `http://example.com/logo.png`). If the user has not provided a specific image URL or uploaded file path, use structured text styling (organization name, address, tax ID) with typographic hierarchy.
-3. **Single Default Enforced**: Only one Letter Head should be marked `is_default: 1`. Before creating or setting a default, check existing defaults via `list_documents(doctype="Letter Head", filters=[["is_default", "=", 1]])`. If another letter head is currently default, explain that setting the new one as default will supersede it.
+3. **Single Default Enforced**: Only one Letter Head should be marked `is_default: 1`. Before creating or setting a default, check existing defaults via `list_documents(doctype="Letter Head", filters={"is_default": 1})`. If another letter head is currently default, explain that setting the new one as default will supersede it.
 4. **Duplicate Prevention**: Before creating, check whether `letter_head_name` already exists using `list_documents`.
 5. **Layout Guidelines**:
    * Header height should be bounded (typically 60-100px).

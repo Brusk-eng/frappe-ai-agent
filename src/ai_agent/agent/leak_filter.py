@@ -33,6 +33,7 @@ _TOOL_NAMES = (
     "get_doctype_meta",
     "web_search",
     "fetch_web_page",
+    "load_skill",
 )
 
 

@@ -2,6 +2,7 @@
 name: custom-field
 description: Add custom fields and override standard field properties using Custom Field and Property Setter records.
 risk: writes
+governs: Custom Field, Property Setter
 ---
 
 <!-- records:

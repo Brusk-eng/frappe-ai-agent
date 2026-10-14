@@ -23,14 +23,25 @@ _DEFAULT_SKILLS_DIR = Path(__file__).resolve().parent.parent / "skills"
 FRONTMATTER_PATTERN = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
 RECORDS_COMMENT_PATTERN = re.compile(r"<!--\s*records:\s*\n(.*?)\s*-->", re.DOTALL)
 
-# Sensitive DocTypes where any modification carries always-ask risk
+# Records that carry code or privilege: a change to one is never covered by an auto-approve mode,
+# and the sidebar shows its full content. A client or server script runs for every user, a webhook
+# sends data out, a role or permission changes who can do what.
 ALWAYS_ASK_DOCTYPES = frozenset(
     {
         "Client Script",
+        "Server Script",
+        "Webhook",
+        "Scheduled Job Type",
+        "Custom HTML Block",
+        "Website Theme",
+        "Website Script",
         "User",
+        "Role",
         "Role Profile",
         "User Permission",
+        "DocPerm",
         "Custom DocPerm",
+        "Workflow",
     }
 )
 
@@ -43,6 +54,10 @@ class Skill:
     content: str
     source: str = "bundled"
     records: dict[str, list[str]] = field(default_factory=dict)
+    # Writes this skill is the instruction for: a record type ("Print Format") or a tool and a
+    # record type ("create_document:User"). A write the model makes without having read it is
+    # sent back with the skill.
+    governs: tuple[str, ...] = ()
 
 
 def _parse_yaml_simple(raw: str) -> dict[str, str]:
@@ -57,6 +72,21 @@ def _parse_yaml_simple(raw: str) -> dict[str, str]:
     return out
 
 
+def _parse_records(block: str) -> dict[str, list[str]]:
+    """The `records:` comment (`DocType:` then `- field` lines) as {doctype: [fields]}."""
+    records: dict[str, list[str]] = {}
+    current: list[str] | None = None
+    for line in block.splitlines():
+        if not line.strip():
+            continue
+        if line.startswith((" ", "\t")):
+            if current is not None:
+                current.append(line.strip().removeprefix("-").strip())
+        else:
+            current = records.setdefault(line.strip().rstrip(":").strip(), [])
+    return records
+
+
 def parse_skill_text(content: str, source: str = "bundled") -> Skill | None:
     """Parse a SKILL.md content into a Skill object."""
     fm_match = FRONTMATTER_PATTERN.match(content)
@@ -69,12 +99,20 @@ def parse_skill_text(content: str, source: str = "bundled") -> Skill | None:
     if not name or not desc:
         return None
     body = content[fm_match.end() :].strip()
+    # the records comment is for the field check in CI; the model has no use for it
+    records_match = RECORDS_COMMENT_PATTERN.search(body)
+    records = _parse_records(records_match.group(1)) if records_match else {}
+    if records_match:
+        body = (body[: records_match.start()] + body[records_match.end() :]).strip()
+    governs = tuple(g.strip() for g in fm.get("governs", "").split(",") if g.strip())
     return Skill(
         name=name,
         description=desc,
         risk=risk,
         content=body,
         source=source,
+        records=records,
+        governs=governs,
     )
 
 
@@ -97,7 +135,7 @@ def load_bundled_skills(skills_dir: Path | None = None) -> dict[str, Skill]:
             skill = parse_skill_text(raw, source="bundled")
             if skill and skill.name == item.name:
                 skills[skill.name] = skill
-        except Exception as exc:
+        except (OSError, UnicodeDecodeError) as exc:
             logger.warning("failed_to_load_skill", skill=item.name, error=str(exc))
     return skills
 
@@ -109,7 +147,8 @@ def build_skills_catalog(skills: dict[str, Skill]) -> str:
     lines = [
         "# Assistant Skills",
         "",
-        "When a user's request matches one of these specialized skills, call load_skill to read its full instructions before taking action:",
+        "When a user's request matches one of these specialized skills, call load_skill to read "
+        "its full instructions before taking action:",
     ]
     for name in sorted(skills):
         skill = skills[name]
@@ -135,7 +174,7 @@ def build_skill_tool(
                 site_skill = await fetch_site_skill(name)
                 if site_skill is not None:
                     return site_skill.content
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - a site's skill failing must not fail the turn
                 logger.warning("site_skill_fetch_failed", skill=name, error=str(exc))
 
         # 2. Shipped skill
@@ -165,4 +204,15 @@ def assess_risk(name: str, args: dict[str, Any]) -> str | None:
     dt = str(args.get("dt") or "").strip()
     if dt in ALWAYS_ASK_DOCTYPES:
         return "always-ask"
+    return None
+
+
+def skill_for_write(skills: dict[str, Skill], tool: str, args: dict[str, Any]) -> Skill | None:
+    """The skill that governs this write, if there is one."""
+    doctype = str(args.get("doctype") or "").strip()
+    if not doctype:
+        return None
+    for skill in skills.values():
+        if doctype in skill.governs or f"{tool}:{doctype}" in skill.governs:
+            return skill
     return None

@@ -51,7 +51,7 @@ Do not call write, delete, or shell tools.
 3. **Investigation Sequence**:
    * Fetch `System Health Report` via `get_document(doctype="System Health Report", name="System Health Report")`.
    * If `failing_scheduled_jobs` is present or `total_errors` is elevated, fetch recent rows from `Error Log` via `list_documents(doctype="Error Log", order_by="creation desc", page_length=5)`.
-   * If email issues are indicated, query `Email Queue` via `list_documents(doctype="Email Queue", filters=[["status", "=", "Error"]], page_length=5)`.
+   * If email issues are indicated, query `Email Queue` via `list_documents(doctype="Email Queue", filters={"status": "Error"}, page_length=5)`.
 4. **Report Structure**:
    * Present findings with a Status table or list:
      - Background Scheduler & Workers

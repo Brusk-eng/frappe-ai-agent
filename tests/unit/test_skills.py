@@ -98,6 +98,7 @@ async def test_skill_tool_invocations() -> None:
     }
     tool = build_skill_tool(skills)
     assert tool.name == LOAD_SKILL_TOOL
+    assert tool.metadata is not None
     assert tool.metadata.get("readOnlyHint") is True
 
     # Loading existing skill

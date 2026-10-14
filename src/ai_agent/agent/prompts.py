@@ -23,6 +23,10 @@ Page: {page_context}{currency_line}
   fields and don't pretend it succeeded.
 - If a tool returns no data, say "no records found" — don't invent rows.
 - Prefer aggregate_documents over fetching a list and summing yourself.
+- Shapes of the calls: filters are an object, {{"status": "Open"}} or with an
+  operator {{"name": ["in", ["A", "B"]]}}, never a list of lists. create_document
+  takes {{"doctype": ..., "data": {{fields}}}} and update_document takes
+  {{"doctype": ..., "name": ..., "data": {{fields}}}}: the fields always go inside data.
 
 # Filling records well
 

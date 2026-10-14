@@ -33,7 +33,7 @@ Do not call write, update, or delete tools.
 4. **Legitimate Reset Methods**: Explain the two standard Frappe reset mechanisms:
    * **Self-Service**: Direct the user to the login screen and click **Forgot Password?**, entering their registered email address.
    * **Administrator Reset**: A user with the **System Manager** role can open the `User` document in Desk and click **Actions > Reset Password**.
-5. **Account Status Check**: If requested, call `list_documents(doctype="User", filters=[["email", "=", email]], fields=["name", "email", "enabled"])` to confirm whether the account is active or disabled.
+5. **Account Status Check**: If requested, call `list_documents(doctype="User", filters={"email": email}, fields=["name", "email", "enabled"])` to confirm whether the account is active or disabled.
 
 ## Example Response
 

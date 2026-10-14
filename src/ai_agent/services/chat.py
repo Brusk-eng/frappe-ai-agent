@@ -473,12 +473,9 @@ class ChatService:
 
     def _system_prompt(self, context: dict[str, Any], tools_unavailable_reason: str | None) -> str:
         """The turn's system prompt, carrying the note the model needs when its tools are down."""
-        try:
-            preamble = self._build_system_prompt(context or {}, skills_catalog=self._skills_catalog)
-        except TypeError:
-            preamble = self._build_system_prompt(context or {})
-            if self._skills_catalog:
-                preamble += f"\n\n{self._skills_catalog}"
+        preamble = self._build_system_prompt(context or {})
+        if self._skills_catalog:
+            preamble = f"{preamble}\n\n{self._skills_catalog}"
         if tools_unavailable_reason is None:
             return preamble
         # Soft-degraded: tell the model so it answers data
@@ -648,6 +645,7 @@ class ChatService:
                                 callbacks=[decode],
                                 session=session_id,
                                 confirmed=_confirmed_call(confirmation),
+                                skills=self._skills,
                             ),
                         ):
                             for out in events.observe(ev, t0=t0, session_id=session_id):

@@ -2,6 +2,7 @@
 name: user-access
 description: Modify user roles, account active status, and user permissions while preventing lockout of the final System Manager.
 risk: always-ask
+governs: update_document:User, create_document:User Permission, update_document:User Permission
 ---
 
 <!-- records:
@@ -39,9 +40,9 @@ Do not use raw SQL or shell commands.
 
 1. **Read Before Modifying Roles**: In Frappe, the `roles` child table is completely replaced during an update, never merged. You must first fetch the user with `get_document(doctype="User", name=user_name)` to retrieve the current roles, calculate the additions or removals, and supply the full updated list.
 2. **Never Remove the Last System Manager**:
-   * Before removing the `System Manager` role or setting `enabled: 0` on a System Manager, check if other active System Managers exist using `list_documents(doctype="User", filters=[["enabled", "=", 1]], fields=["name"])` alongside `Has Role` checks.
+   * Before removing the `System Manager` role or setting `enabled: 0` on a System Manager, check if other active System Managers exist using `list_documents(doctype="User", filters={"enabled": 1}, fields=["name"])` alongside `Has Role` checks.
    * If the user is the sole remaining active System Manager, refuse the action and explain the lockout risk.
-3. **Role Validation**: When adding roles, verify each role name exists using `list_documents(doctype="Role", filters=[["name", "=", role_name]])`.
+3. **Role Validation**: When adding roles, verify each role name exists using `list_documents(doctype="Role", filters={"name": role_name})`.
 4. **User Permissions**:
    * Scopes a user's visibility for a specific DocType value (e.g. restrict to a Company or Territory).
    * Fields: `user` (User email), `allow` (DocType name like `Company`), `for_value` (record name like `Acme Ltd`), `is_default` (0 or 1), `apply_to_all_doctypes` (1).

@@ -207,7 +207,7 @@ async def test_a_second_write_the_model_asks_for_pauses_again():
                             "type": "tool_call",
                             "payload": {
                                 "name": "create_document",
-                                "arguments": {"doctype": "Lead"},
+                                "arguments": {"doctype": "Lead", "data": {"lead_name": "Examplia"}},
                             },
                         }
                     ]
@@ -226,7 +226,7 @@ async def test_a_second_write_the_model_asks_for_pauses_again():
 
     assert calls == [{"doctype": "Customer"}]
     assert [e["type"] for e in events] == ["tool_call", "content", "tool_confirm"]
-    assert events[-1]["arguments"] == {"doctype": "Lead"}
+    assert events[-1]["arguments"] == {"doctype": "Lead", "data": {"lead_name": "Examplia"}}
 
 
 # --- the route -----------------------------------------------------------------

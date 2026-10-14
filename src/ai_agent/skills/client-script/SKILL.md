@@ -2,6 +2,7 @@
 name: client-script
 description: Write client-side form scripts in Frappe with plain-words explanation, full code display, and disable instructions.
 risk: always-ask
+governs: Client Script
 ---
 
 <!-- records:
