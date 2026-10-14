@@ -647,17 +647,9 @@ async def _write_problem(
     rows, shape = _rows_of(name, args)
     if shape is not None:
         return shape
-    meta = ""
-    if "get_document" in registry.names():
-        meta = await registry.ainvoke("get_document", {"doctype": "DocType", "name": doctype})
-        # a DocType the site lacks: Frappe says so, or fails on the module it cannot import
-        if meta.startswith("Tool call failed") and (
-            _NOT_FOUND in meta or "No module named" in meta
-        ):
-            return await _missing_doctype(doctype, registry)
-        # a definition that could not be read checks nothing; the write will say what it says
-        if meta.startswith(("Tool call failed", "Access denied", "error:")):
-            meta = ""
+    meta, missing = await _read_definition(doctype, registry)
+    if missing is not None:
+        return missing
     problems: list[str] = []
     creates = name != "update_document"
     if meta and creates and not _definition_read(doctype, evidence):
@@ -668,26 +660,53 @@ async def _write_problem(
         problems.append(_brief_note(doctype, brief, WEB_SEARCH_TOOL in registry.names()))
     checked: dict[tuple[str, str], bool] = {}  # (target, value) → exists, once a batch
     for label, row in rows:
-        if meta and creates and (empty := missing_required(meta, row)):
-            lines = [line + await _existing_records(target, registry) for line, target in empty]
-            problems.append(
-                label
-                + f"These required fields of {doctype} are empty:\n"
-                + "\n".join(lines)
-                + "\nFill each yourself: from the request or what you have read, and for a Link "
-                "field from the existing records shown (when there is only one, use it; when the "
-                "request points to one, use that). Ask the user only when it is a real choice "
-                "between several, naming them."
-            )
-        for problem in await _unknown_links(row, meta, registry, checked):
-            problems.append(label + problem)
-        for problem in _row_problems(row, meta, doctype, evidence):
+        for problem in await _row_issues(row, meta, doctype, creates, registry, evidence, checked):
             if (labelled := label + problem) not in problems:
                 problems.append(labelled)
         if len(problems) >= _MAX_ROW_PROBLEMS:
             problems.append("Other rows may have the same problems; check them all.")
             break
     return " ".join(problems) or None
+
+
+async def _read_definition(doctype: str, registry: ToolRegistry) -> tuple[str, str | None]:
+    """The DocType's definition ("" when it cannot be read), or why the site has no such DocType."""
+    if "get_document" not in registry.names():
+        return "", None
+    meta = await registry.ainvoke("get_document", {"doctype": "DocType", "name": doctype})
+    # a DocType the site lacks: Frappe says so, or fails on the module it cannot import
+    if meta.startswith("Tool call failed") and (_NOT_FOUND in meta or "No module named" in meta):
+        return "", await _missing_doctype(doctype, registry)
+    # a definition that could not be read checks nothing; the write will say what it says
+    if meta.startswith(("Tool call failed", "Access denied", "error:")):
+        return "", None
+    return meta, None
+
+
+async def _row_issues(
+    row: dict[str, Any],
+    meta: str,
+    doctype: str,
+    creates: bool,
+    registry: ToolRegistry,
+    evidence: list[str],
+    checked: dict[tuple[str, str], bool],
+) -> list[str]:
+    """One row's problems: required fields left empty (on a create), Link values that are no
+    record, unknown fields, and values never read."""
+    problems: list[str] = []
+    if meta and creates and (empty := missing_required(meta, row)):
+        lines = [line + await _existing_records(target, registry) for line, target in empty]
+        problems.append(
+            f"These required fields of {doctype} are empty:\n"
+            + "\n".join(lines)
+            + "\nFill each yourself: from the request or what you have read, and for a Link "
+            "field from the existing records shown (when there is only one, use it; when the "
+            "request points to one, use that). Ask the user only when it is a real choice "
+            "between several, naming them."
+        )
+    problems += await _unknown_links(row, meta, registry, checked)
+    return problems + _row_problems(row, meta, doctype, evidence)
 
 
 async def _unknown_links(
@@ -758,7 +777,8 @@ def _brief_note(doctype: str, brief: str, web: bool) -> str:
         "Fill every field that the request, the earlier turns or what you have read supports. "
         "A Link field takes the existing record that matches what you know: find it with "
         "list_documents filtered on that value (a name like '%India%'), never by taking the "
-        "first row of an unfiltered list. An optional field nothing supports is left out: "
+        "first row of an unfiltered list; when several match, take the one whose name is exactly "
+        "what the request says. An optional field nothing supports is left out: "
         "never ask the user about an optional field, or to confirm a value you already have."
     )
     if web:
