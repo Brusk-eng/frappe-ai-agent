@@ -208,11 +208,11 @@ def assess_risk(name: str, args: dict[str, Any]) -> str | None:
 
 
 def skill_for_write(skills: dict[str, Skill], tool: str, args: dict[str, Any]) -> Skill | None:
-    """The skill that governs this write, if there is one."""
-    doctype = str(args.get("doctype") or "").strip()
-    if not doctype:
+    """The skill that governs this call, if there is one: by record type, or by report name."""
+    target = str(args.get("doctype") or args.get("report_name") or "").strip()
+    if not target:
         return None
     for skill in skills.values():
-        if doctype in skill.governs or f"{tool}:{doctype}" in skill.governs:
+        if target in skill.governs or f"{tool}:{target}" in skill.governs:
             return skill
     return None

@@ -84,6 +84,8 @@ async def test_a_turn_whose_tools_all_failed_is_not_high_quality():
         "args": {"doctype": "Customer"},
         "ok": False,
         "error_type": "RuntimeError",
+        # what the next turn reads back: it failed, and how
+        "outcome": "Tool call failed: Frappe returned HTTP 500",
     }
 
 

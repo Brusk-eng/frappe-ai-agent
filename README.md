@@ -87,7 +87,7 @@ Streaming chat endpoint. Returns `text/event-stream`.
 
 - `message` — required, 1–32 000 chars, non-whitespace.
 - `session_id` — optional. Omit on the first turn; the agent creates a session and announces its id in the first SSE frame. Pass that id back on subsequent turns to continue the conversation.
-- `context` — optional page context. Recognised keys: `doctype`, `docname`, `route`, `currency` (three ASCII letters, the shape of an ISO 4217 alpha-3 code; anything else and the answer names no currency). Everything else is ignored.
+- `context` — optional page context. Recognised keys: `doctype`, `docname`, `route`, `model` (one of `GET /api/v1/models`; anything else gets the default model), `today` (the site's date as `YYYY-MM-DD`; without it the agent uses its own server date, which can be a day off the site's time zone), `currency` (three ASCII letters, the shape of an ISO 4217 alpha-3 code; anything else and the answer names no currency). Everything else is ignored.
 
 **Authentication** — must include a Frappe `sid` cookie. Missing or empty cookie → `401`.
 
@@ -116,6 +116,14 @@ An `error` message is one plain line per kind of failure — the turn ran past i
 The wire contract is encoded as `TypedDict`s in [`src/ai_agent/transport/sse_events.py`](src/ai_agent/transport/sse_events.py) (`SessionEvent`, `ToolCallEvent`, `ToolConfirmEvent`, `ContentEvent`, `ContentBlockEvent`, `SourcesEvent`, `ErrorEvent`, `DoneEvent`, tagged on `type` into the `SSEEvent` union). That module is the only definition of the envelope in this system, and `make contract` writes it out as JSON Schema to [`contract/sse-event.schema.json`](contract/sse-event.schema.json) — the published artefact frappe_ai and Metis check their own copies of these frames against. `tests/unit/test_contract_snapshot.py` fails when the two drift apart.
 
 `validate_event(event: dict)` in the same module validates against that union and raises `ValueError` on drift, including a field the union does not declare: the contract is closed, because a consumer's hand-written copy cannot see an extra field and would drop it silently. `tests/unit/test_chat_service.py::test_every_emitted_event_matches_sse_contract` runs it over every event the service emits in a typical turn. Nothing type-checks the generators' `yield`s yet, so a frame on a path that test does not walk is still only caught at runtime.
+
+### `GET /api/v1/models`
+
+The models a user may pick, for the sidebar's menu, discovered from the provider and cached for 10 minutes. Takes the same `sid` as `POST /api/v1/chat`. When the provider cannot be asked, only the default model is listed.
+
+```json
+{"models": [{"id": "openai/gpt-4.1-mini", "label": "GPT-4.1 mini"}], "default": "openai/gpt-4.1-mini"}
+```
 
 ### `GET /health`
 
@@ -163,12 +171,14 @@ there is silent — check the resolved values on `GET /config`.
 | `AI_AGENT_LLM_BASE_URL` | `http://localhost:11434` | Provider base URL |
 | `AI_AGENT_LLM_API_KEY` | _empty_ | API key for hosted providers |
 | `AI_AGENT_LLM_MODEL` | `qwen3.5:9b` | Model identifier |
+| `AI_AGENT_LLM_MODELS_FILTER` | _empty_ | The sidebar's model menu is discovered from the provider (`GET {AI_AGENT_LLM_BASE_URL}/models`, or Ollama's `/api/tags`), keeping models that can answer in a JSON schema where the provider says. This narrows it to ids starting with, or equal to, these comma-separated entries (`openai/,anthropic/`). Empty offers them all; the default model is always first |
 | `AI_AGENT_LLM_TEMPERATURE` | `0.2` | Low default tightens tool-call argument formatting on small local models |
 | `AI_AGENT_LLM_MAX_TOKENS` | `8192` | Max output tokens (Ollama `num_predict`) |
 | `AI_AGENT_LLM_NUM_CTX` | `16384` | Ollama context window. Ignored for hosted providers. The Ollama default of 2048 is too small for system prompt + tool results + answer |
 | `AI_AGENT_LLM_REQUEST_TIMEOUT_S` | `60.0` | Bound on one model call, as the httpx timeout under the provider client. Ollama's own client default is no timeout at all |
 | `AI_AGENT_AGENT_TURN_TIMEOUT_S` | `90.0` | Wall-clock bound on one chat turn. On expiry the turn ends with an `error` event and `done` with `data_quality: "low"` |
 | `AI_AGENT_AGENT_PROMPT_TEXT_MAX_CHARS` | `8000` | Longest single tool result or history row that may enter the prompt; the rest is cut with a `[truncated to N characters]` marker |
+| `AI_AGENT_AGENT_HISTORY_CHARS` | `24000` | How much of the conversation's recent turns is replayed in full as the model's memory: each turn's calls, the results it read, and its reply. Older turns, and any past the budget, are replayed as their reply text |
 | `AI_AGENT_AGENT_RECURSION_LIMIT` | `50` | Envelope-loop ceiling. The loop runs half of it (25) model-tool rounds per turn, since a round is one model call plus its tool calls; small models need the headroom while exploring doctype schemas before converging |
 | `AI_AGENT_AGENT_RATE_LIMIT` | `30/minute` | slowapi-format per-sid rate limit on `POST /api/v1/chat` (e.g. `100/hour`, `10/second`) |
 | `AI_AGENT_RATE_LIMIT_STORAGE_URI` | `memory://` | Where the rate limit is counted. The default counts in the worker's own memory, so N workers let one sid make N times the limit; point it at the Redis the stack already runs (`redis://redis:6379/1`) and they share one count. A URI slowapi cannot open is refused at startup rather than silently not limiting. |

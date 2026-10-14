@@ -27,6 +27,7 @@ _TOOL_NAMES = (
     "get_document",
     "aggregate_documents",
     "create_document",
+    "create_documents",
     "update_document",
     "delete_document",
     "run_report",

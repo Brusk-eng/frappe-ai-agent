@@ -17,6 +17,7 @@ from ai_agent.agent.prompts import build_system_prompt
 from ai_agent.config import Settings
 from ai_agent.integrations.frappe_routes import SiteResolver
 from ai_agent.integrations.llm import create_llm
+from ai_agent.integrations.models import ModelCatalog
 from ai_agent.middleware.request_id import RequestIDMiddleware
 from ai_agent.middleware.site import SiteMiddleware
 from ai_agent.observability.logging import setup_logging
@@ -52,10 +53,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # Built here, not in lifespan: routes wired there are missing from app.routes until the
     # first request. Keep this construction free of network I/O.
     llm = create_llm(settings)
+    models = ModelCatalog(settings)  # asks the provider on first use, not here
     chat_service = ChatService(
         settings=settings,
         llm=llm,
         system_prompt_builder=build_system_prompt,
+        models=models,
     )
     health_service = HealthService(settings=settings)
     limiter = Limiter(key_func=_sid_or_ip_key, storage_uri=settings.rate_limit_storage_uri)
@@ -111,6 +114,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         create_rest_router(
             settings=settings,
             health_service=health_service,
+            models=models,
         )
     )
     app.include_router(

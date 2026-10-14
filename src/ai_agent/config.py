@@ -61,6 +61,10 @@ class Settings(BaseSettings):
     llm_base_url: str = "http://localhost:11434"
     llm_api_key: str = ""
     llm_model: str = "qwen3.5:9b"
+    # Narrows the models discovered from the provider (GET {llm_base_url}/models) to those whose
+    # id starts with, or equals, one of these comma-separated entries: "openai/,anthropic/".
+    # Empty offers every model the provider lists that can answer in a JSON schema.
+    llm_models_filter: str = ""
     # Low for tool-call arguments: qwen3.5:9b wrote malformed tool-call XML at 0.7.
     llm_temperature: float = 0.2
     llm_max_tokens: int = 8192
@@ -75,6 +79,10 @@ class Settings(BaseSettings):
     agent_turn_timeout_s: float = 90.0
     # The longest tool result or history row that may enter the prompt; the rest is cut.
     agent_prompt_text_max_chars: int = 8000
+    # How much of the conversation's recent turns is replayed in full (calls, results and replies)
+    # as the model's memory, in characters; older turns, and any past the budget, are replayed as
+    # their reply text. Keep it inside the model's context with the system prompt and this turn.
+    agent_history_chars: int = 24000
     # Small models loop exploring schema; the loop runs this // 2 model-tool rounds per turn.
     agent_recursion_limit: int = 50
     # Per-sid rate limit on POST /api/v1/chat. slowapi syntax: "<count>/<period>"

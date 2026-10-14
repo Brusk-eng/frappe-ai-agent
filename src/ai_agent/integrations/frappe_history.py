@@ -25,6 +25,8 @@ _history_write_failures = _meter.create_counter(
 )
 
 _SESSION_URL_PATH = "/api/resource/AI Chat Session"
+# Sessions this process has seen exist, so a turn does not look its session up again.
+_KNOWN_SESSIONS_MAX = 10_000
 _MESSAGE_URL_PATH = "/api/resource/AI Chat Message"
 _VERSIONS_URL_PATH = "/api/method/frappe.utils.change_log.get_versions"
 # the app that defines both doctypes; ADR-011 makes it their owner
@@ -57,6 +59,43 @@ def _with_blocks(text: str, tool_result_json: Any) -> str:
     return f"{text}\n\n{shown}" if text else shown
 
 
+# What a reply did, written into its place in the conversation: the text alone did not say a
+# search had run or which records were made, and the next turn acted as if neither had happened.
+ACTIONS_MARK = "[Tools used in this reply"
+_ACTIONS_CHARS = 2000
+_TITLE_FIELDS = ("subject", "title", "lead_name", "company_name", "customer_name", "item_name")
+
+
+def _with_actions(text: str, tool_args_json: Any) -> str:
+    """The reply with a note of the calls it made and what they did, for the model's memory."""
+    try:
+        calls = json.loads(tool_args_json or "[]")
+    except (ValueError, TypeError):
+        return text
+    lines = [_action_line(c) for c in calls if isinstance(c, dict) and c.get("name")]
+    if not lines:
+        return text
+    note = f"{ACTIONS_MARK}, written by the system:\n" + "\n".join(lines) + "]"
+    note = note[:_ACTIONS_CHARS]
+    return f"{text}\n\n{note}" if text else note
+
+
+def _action_line(call: dict[str, Any]) -> str:
+    raw_args = call.get("args")
+    args: dict[str, Any] = raw_args if isinstance(raw_args, dict) else {}
+    what = [str(args[k]) for k in ("doctype", "name", "report_name", "query", "url") if args.get(k)]
+    raw_data = args.get("data")
+    data: dict[str, Any] = raw_data if isinstance(raw_data, dict) else {}
+    title = next((str(data[f]) for f in _TITLE_FIELDS if data.get(f)), "")
+    if title:
+        what.append(repr(title[:80]))
+    rows = args.get("rows")
+    if isinstance(rows, list):
+        what.append(f"{len(rows)} rows")
+    status = call.get("outcome") or ("ok" if call.get("ok") else "failed")
+    return f"- {call['name']}({', '.join(what)}): {status}"
+
+
 def _headers(sid: str, site: str | None = None) -> dict[str, str]:
     """Who the call is for, and which answer it belongs to (ADR-008)."""
     headers = {"Cookie": f"sid={sid}", **correlation.frappe_header()}
@@ -78,6 +117,8 @@ class FrappeHistoryClient:
         self._closed = False
         # Whether each site has the chat doctypes at all; keyed by site name.
         self._doctypes_exist: dict[str | None, bool] = {}
+        # (site, session name) pairs known to exist; see ensure_session.
+        self._known_sessions: set[tuple[str | None, str]] = set()
 
     def _get_client(self) -> httpx.AsyncClient:
         # Raise, not rebuild: a new client here would leak, since aclose() returns once closed.
@@ -134,7 +175,18 @@ class FrappeHistoryClient:
         site: str | None = None,
         base_url: str | None = None,
     ) -> str | None:
-        """Ensure session `name` exists: a message's Link check fails without its row."""
+        """Ensure session `name` exists: a message's Link check fails without its row.
+
+        Looked up before it is created. Creating a row that exists fails with a duplicate-entry
+        error, and Frappe writes an Error Log row for each one: on every turn of every chat, that
+        buried real errors and made a health check report problems that were not there.
+        """
+        key = (site, name)
+        if key in self._known_sessions:
+            return name
+        if await self._session_exists(sid, name, site=site, base_url=base_url):
+            self._remember_session(key)
+            return name
         effective_base = (base_url or self._base_url).rstrip("/")
         url = f"{effective_base}{_SESSION_URL_PATH}"
         payload = {"name": name, "title": title, "context_json": context_json}
@@ -144,7 +196,38 @@ class FrappeHistoryClient:
         # If creation returned the name, great. Otherwise assume it failed
         # because the row already exists (idempotent) — return the supplied
         # name so the caller can keep using it.
+        if result:
+            self._remember_session(key)
         return result or name
+
+    def _remember_session(self, key: tuple[str | None, str]) -> None:
+        if len(self._known_sessions) >= _KNOWN_SESSIONS_MAX:
+            self._known_sessions.clear()  # a bound, not an LRU: a miss costs one lookup
+        self._known_sessions.add(key)
+
+    async def _session_exists(
+        self, sid: str, name: str, site: str | None = None, base_url: str | None = None
+    ) -> bool:
+        """Whether the caller can see session `name`; False when unknown, so a create is tried."""
+        if self._doctypes_exist.get(site) is False:
+            return False  # the site has no chat doctypes; nothing to look up
+        effective_base = (base_url or self._base_url).rstrip("/")
+        params = {
+            "doctype": "AI Chat Session",
+            "fields": json.dumps(["name"]),
+            "filters": json.dumps([["name", "=", name]]),
+            "limit_page_length": "1",
+        }
+        try:
+            resp = await self._get_client().get(
+                f"{effective_base}/api/method/frappe.client.get_list",
+                params=params,
+                headers=_headers(sid, site),
+            )
+            return resp.status_code == 200 and bool(resp.json().get("message"))
+        except (httpx.HTTPError, ValueError, AttributeError) as exc:
+            logger.debug("chat_history_session_lookup_failed", error=str(exc)[:200], site=site)
+            return False
 
     async def save_message(
         self,
@@ -156,6 +239,7 @@ class FrappeHistoryClient:
         tool_name: str | None = None,
         tool_args_json: str | None = None,
         tool_result_json: str | None = None,
+        transcript_json: str | None = None,
         site: str | None = None,
         base_url: str | None = None,
     ) -> str | None:
@@ -173,6 +257,8 @@ class FrappeHistoryClient:
             payload["tool_args_json"] = tool_args_json
         if tool_result_json is not None:
             payload["tool_result_json"] = tool_result_json
+        if transcript_json is not None:
+            payload["transcript_json"] = transcript_json
         return await self._post_and_extract_name(
             url, payload, sid, "message", site=site, base_url=base_url
         )
@@ -191,7 +277,9 @@ class FrappeHistoryClient:
         url = f"{effective_base}/api/method/frappe.client.get_list"
         params = {
             "doctype": "AI Chat Message",
-            "fields": json.dumps(["role", "content", "tool_result_json"]),
+            "fields": json.dumps(
+                ["role", "content", "tool_result_json", "tool_args_json", "transcript_json"]
+            ),
             "filters": json.dumps([["session", "=", session]]),
             "order_by": "creation desc",
             "limit_page_length": str(max(1, limit)),
@@ -215,8 +303,12 @@ class FrappeHistoryClient:
                     continue  # a failed turn's error text was for the user, not an answer
                 if r.get("role") == "assistant":
                     content = _with_blocks(content, r.get("tool_result_json"))
-                if r.get("role") in ("user", "assistant") and content:
-                    rows.append({"role": str(r["role"]), "content": content})
+                    content = _with_actions(content, r.get("tool_args_json"))
+                transcript = str(r.get("transcript_json") or "")
+                if r.get("role") in ("user", "assistant") and (content or transcript):
+                    rows.append(
+                        {"role": str(r["role"]), "content": content, "transcript": transcript}
+                    )
             rows.reverse()  # oldest-first for LLM context
             return rows
         except (httpx.HTTPError, ValueError, AttributeError, TypeError) as exc:

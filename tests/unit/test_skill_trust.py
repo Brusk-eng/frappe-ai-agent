@@ -277,3 +277,36 @@ class TestSkillForTheWrite:
         assert governing("create_document", "User") == "user-create"
         assert governing("update_document", "User") == "user-access"
         assert governing("create_document", "Property Setter") == "custom-field"
+
+
+class TestReadsAndStrayBlocks:
+    @pytest.mark.asyncio
+    async def test_a_finance_report_run_without_its_skill_waits_for_the_skill(self):
+        report = _call(
+            "run_report",
+            {"report_name": "Profit and Loss Statement", "filters": {"from_date": "x"}},
+        )
+        final = {"blocks": [{"type": "text", "payload": {"content": "Profit: 1."}}]}
+        llm, seen = _recording_llm([[report], [report], [final]])
+        reg = _Reg({"run_report": "Profit for the year 1"})
+        await _drain(
+            run_agent_loop(
+                llm=llm, tool_registry=reg, user_message="profit?", skills=load_bundled_skills()
+            )
+        )
+        note = str(seen[1][-1].content)
+        assert "not run: read the financial-reports skill" in note
+        assert "skill financial-reports" in note and "filter_based_on" in note
+        assert [c[0] for c in reg.calls] == ["run_report"]  # run once, after the skill
+
+    @pytest.mark.asyncio
+    async def test_a_block_typed_as_a_tool_is_run_as_that_tool(self):
+        stray = {
+            "blocks": [{"type": "list_documents", "payload": {"arguments": {"doctype": "Lead"}}}]
+        }
+        final = {"blocks": [{"type": "text", "payload": {"content": "Done."}}]}
+        llm, _ = _recording_llm([[stray], [final]])
+        reg = _Reg({"list_documents": "[]"})
+        events = await _drain(run_agent_loop(llm=llm, tool_registry=reg, user_message="leads?"))
+        assert reg.calls == [("list_documents", {"doctype": "Lead"})]
+        assert not any("couldn't be rendered" in e.get("text", "") for e in events)

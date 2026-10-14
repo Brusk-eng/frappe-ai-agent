@@ -42,6 +42,10 @@ def _csrf() -> None:
 def _a_site_without_frappe_ai() -> None:
     _csrf()
     respx.get(_VERSIONS_URL).mock(return_value=httpx.Response(200, json=_WITHOUT))
+    # the session lookup before a create: a site without the doctype cannot list it
+    respx.get(f"{BASE}/api/method/frappe.client.get_list").mock(
+        return_value=httpx.Response(500, json=_NO_CONTROLLER)
+    )
     respx.post(_SESSION_URL).mock(return_value=httpx.Response(500, json=_NO_CONTROLLER))
     respx.post(_MESSAGE_URL).mock(return_value=httpx.Response(500, json=_NO_CONTROLLER))
 

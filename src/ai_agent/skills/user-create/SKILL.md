@@ -2,7 +2,7 @@
 name: user-create
 description: Create a Frappe user with a welcome email verification link and assigned roles without accepting passwords.
 risk: always-ask
-governs: create_document:User
+governs: create_document:User, create_documents:User
 ---
 
 <!-- records:

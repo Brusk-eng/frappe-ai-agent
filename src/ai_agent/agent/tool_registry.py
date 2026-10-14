@@ -120,7 +120,7 @@ class ToolRegistry:
                     result = _exception_to_result(exc)
                 else:
                     result = _as_text(raw)
-            self._record(span, name, args, started, error_type)
+            self._record(span, name, args, started, error_type, result)
             return result
 
     def _record(
@@ -130,6 +130,7 @@ class ToolRegistry:
         args: dict[str, Any] | None,
         started: float,
         error_type: str | None,
+        result: str = "",
     ) -> None:
         """Put the call's outcome on its span and in the turn's audit trail."""
         hidden = AGENT_ARGS.get(name, set())
@@ -143,6 +144,8 @@ class ToolRegistry:
             call["error_type"] = error_type
             span.set_attribute("error.type", error_type)
             span.set_status(Status(StatusCode.ERROR, error_type))
+        if outcome := call_outcome(name, result, failed=error_type is not None):
+            call["outcome"] = outcome
         self.invocations.append(call)
 
 
@@ -200,3 +203,47 @@ def _render_args_schema(tool: BaseTool) -> str:
         else:
             parts.append(f"{field_name}{mark}: {t}")
     return "{" + "; ".join(parts) + "}"
+
+
+# What a later turn needs to know a call did, kept with the answer. A write's new record name, a
+# search's titles and links, a report's size: without them the model on the next turn said it
+# had never searched, and created a task it had already created. Reads that can be redone keep none.
+_OUTCOME_CHARS = 160
+_SEARCH_OUTCOME_CHARS = 700
+_FIRST_LINE_TOOLS = frozenset(
+    {
+        "create_document",
+        "create_documents",
+        "update_document",
+        "delete_document",
+        "run_report",
+        "aggregate_documents",
+    }
+)
+
+
+def call_outcome(name: str, result: str, *, failed: bool) -> str | None:
+    """A short line saying what the call did, for the conversation memory; None keeps nothing."""
+    first = (result or "").strip().splitlines()[0][:_OUTCOME_CHARS] if result else ""
+    if failed or name in _FIRST_LINE_TOOLS:
+        return first or None
+    if name == "web_search":
+        return _search_outcome(result)
+    if name == "fetch_web_page":
+        lines = [ln for ln in (result or "").splitlines()[:2] if ln.startswith(("Title:", "URL:"))]
+        return " ".join(lines)[:_OUTCOME_CHARS] or None
+    return None
+
+
+def _search_outcome(result: str) -> str | None:
+    start = result.find("[")
+    try:
+        rows = json.loads(result[start:]) if start >= 0 else []
+    except ValueError:
+        return result.splitlines()[0][:_OUTCOME_CHARS] if result else None
+    hits = [
+        f"{r.get('file_name') or ''} <{r.get('file')}>".strip()
+        for r in rows
+        if isinstance(r, dict) and r.get("file")
+    ]
+    return ("found: " + "; ".join(hits))[:_SEARCH_OUTCOME_CHARS] if hits else "no results"

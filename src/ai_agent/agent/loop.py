@@ -6,6 +6,8 @@ import json
 import re
 from collections.abc import AsyncGenerator, Iterator
 from contextlib import aclosing
+from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
@@ -27,6 +29,7 @@ from ai_agent.agent.condense import (
 )
 from ai_agent.agent.skills import LOAD_SKILL_TOOL, Skill, assess_risk, skill_for_write
 from ai_agent.agent.tool_registry import AGENT_ARGS
+from ai_agent.agent.transcript import PAUSED_NOTE
 from ai_agent.agent.web_tools import WEB_SEARCH_TOOL
 from ai_agent.blocks.envelope import (
     TOOL_CALL_TYPE,
@@ -45,6 +48,8 @@ logger = structlog.get_logger(__name__)
 _REPEAT_LIMIT = 3
 
 KB_TOOL = "search_knowledge_base"
+# Several new records of one doctype in one call, all or nothing; one approval covers the batch.
+BATCH_TOOL = "create_documents"
 # The tools whose results carry passages the answer can cite: `sources` events come from these.
 SOURCE_TOOLS = frozenset({KB_TOOL, WEB_SEARCH_TOOL})
 
@@ -116,6 +121,12 @@ _CONFIRM_SUMMARIES: dict[str, tuple[str, tuple[str, ...]]] = {
 
 def confirm_summary(tool: str, arguments: dict[str, Any]) -> str:
     """One sentence for what a pending write would do, from the call alone."""
+    if tool == BATCH_TOOL:
+        rows = arguments.get("rows")
+        doctype = str(arguments.get("doctype") or "").strip()
+        if isinstance(rows, list) and rows and doctype:
+            return f"Create {len(rows)} new {doctype} record{'s' if len(rows) != 1 else ''}."
+        return f"Run {tool}."
     template, keys = _CONFIRM_SUMMARIES.get(tool, ("", ()))
     values = {key: str(arguments.get(key) or "").strip() for key in keys}
     if not template or not all(values.values()):
@@ -214,6 +225,8 @@ async def _run_tools(
     result_max_chars: int,
     evidence: list[str],
     loaded: set[str],
+    called: set[str],
+    skills: dict[str, Skill] | None = None,
 ) -> AsyncGenerator[dict[str, Any], None]:
     """Announce and run the envelope's calls, then put the attempt and its results in `messages`."""
     for name, args in map(_call, tool_blocks):
@@ -227,7 +240,22 @@ async def _run_tools(
         args = {k: v for k, v in args.items() if k not in AGENT_ARGS.get(name, ())}
         if name == KB_TOOL and session:
             args["session"] = session
+        governing = skill_for_write(skills or {}, name, args)
+        if governing is not None and governing.name not in loaded:
+            # a call its skill exists for, made without reading it: the skill first, then again
+            loaded.add(governing.name)
+            skill_lines.append(f"skill {governing.name}:\n{governing.content}")
+            result_lines.append(
+                _result_line(
+                    name,
+                    args,
+                    f"not run: read the {governing.name} skill below, "
+                    "then make this call again following it.",
+                )
+            )
+            continue
         result = condense_tool_result(name, args, await tool_registry.ainvoke(name, args))
+        called.add(name)
         # the sources come out of the whole result; only the prompt's copy is capped
         if name in SOURCE_TOOLS and (items := _passages(result)):
             yield {"type": "sources", "items": items}
@@ -255,11 +283,18 @@ def _replay(messages: list[BaseMessage], envelope: dict[str, Any], note: str) ->
     messages.append(HumanMessage(content=note))
 
 
-def _wants_nudge(
-    *, nudged: bool, registry: ToolRegistry, step: int, max_steps: int, text: str
-) -> bool:
-    """A final reply that promises a change and made no call, with a step left to make it."""
-    return not nudged and bool(registry.names()) and step + 1 < max_steps and announces_action(text)
+def _final_reply_note(
+    *, nudges: set[str], registry: ToolRegistry, step: int, max_steps: int, text: str
+) -> str | None:
+    """What to send the model back with instead of ending the turn, once per kind of problem."""
+    if step + 1 >= max_steps or not registry.names():
+        return None
+    if "announce" not in nudges and announces_action(text):
+        # The text has gone out; what follows is the call it promised, or a retraction.
+        nudges.add("announce")
+        logger.info("agent_loop_announced_without_call", step=step)
+        return _NUDGE
+    return None
 
 
 async def _write_review(
@@ -302,6 +337,7 @@ def _unrenderable_events(
         "agent_loop_no_emittable_blocks",
         step=step,
         block_types=[b.get("type") for b in non_tool_blocks],
+        blocks=json.dumps(non_tool_blocks, ensure_ascii=False)[:600],
     )
     return [{"type": "content", "text": "I produced a response but it couldn't be rendered."}]
 
@@ -375,8 +411,49 @@ async def _stream_step(
         raise TurnFailure(REPLY_CUT_OFF)
 
 
+@dataclass
+class _TurnState:
+    """What `_agent_turn` leaves behind for its transcript, filled as the turn runs."""
+
+    messages: list[BaseMessage] = dataclass_field(default_factory=list)
+    base: int = 0  # where this turn's own messages start, after the system prompt and history
+    reply: _Reply | None = None
+    paused: bool = False  # the turn ended on a write waiting for the user
+
+    def transcript(self) -> list[BaseMessage]:
+        """This turn's messages, its last reply included, and a note when it stopped to ask."""
+        turn = list(self.messages[self.base :])
+        envelope = self.reply.envelope if self.reply is not None else {}
+        if envelope.get("blocks"):
+            last = json.dumps(envelope, ensure_ascii=False)
+            if not (turn and isinstance(turn[-1], AIMessage) and turn[-1].content == last):
+                turn.append(AIMessage(content=last))
+        if self.paused:
+            turn.append(HumanMessage(content=PAUSED_NOTE))
+        return turn
+
+
 async def run_agent_loop(
+    *, record: list[BaseMessage] | None = None, **kwargs: Any
+) -> AsyncGenerator[dict[str, Any], None]:
+    """Yield the turn's agent events; `record`, when given, receives the turn's transcript.
+
+    The transcript is filled however the turn ends: an answer, a pause for the user, an error or a
+    client that went away, so what was done is never lost from the conversation's memory.
+    """
+    state = _TurnState()
+    try:
+        async with aclosing(_agent_turn(state=state, **kwargs)) as turn:
+            async for event in turn:
+                yield event
+    finally:
+        if record is not None:
+            record.extend(state.transcript())
+
+
+async def _agent_turn(
     *,
+    state: _TurnState,
     llm: BaseChatModel,
     tool_registry: ToolRegistry,
     user_message: str,
@@ -404,8 +481,10 @@ async def run_agent_loop(
     )
 
     reply = _Reply()
+    state.messages, state.base, state.reply = messages, len(messages), reply
     repeats = _RepeatGuard()
-    nudged = False  # one reminder per turn, for a reply that promised a change and made none
+    nudges: set[str] = set()  # the kinds of reminder already sent this turn, one of each
+    called: set[str] = set()  # the tools that have run this turn
     corrections = 0  # writes sent back: skill unread, fields the doctype lacks, values never read
     loaded: set[str] = set()  # the skills the model has read this turn
     # Everything the model has read this turn, kept to check what it writes against.
@@ -432,6 +511,7 @@ async def run_agent_loop(
         ):
             yield ev
 
+        reply.envelope = _calls_typed_as_tools(reply.envelope, tool_registry.names())
         blocks, tool_blocks, non_tool_blocks = _split_blocks(reply.envelope)
 
         # Reachable despite the schema's minItems: 1, when a provider stream stalls.
@@ -464,17 +544,15 @@ async def run_agent_loop(
             yield ev
 
         if not tool_blocks:
-            if _wants_nudge(
-                nudged=nudged,
+            note = _final_reply_note(
+                nudges=nudges,
                 registry=tool_registry,
                 step=step,
                 max_steps=max_steps,
                 text=_text_of(non_tool_blocks),
-            ):
-                # The text has gone out; what follows is the call it promised, or a retraction.
-                nudged = True
-                logger.info("agent_loop_announced_without_call", step=step)
-                _replay(messages, reply.envelope, _NUDGE)
+            )
+            if note is not None:
+                _replay(messages, reply.envelope, note)
                 continue
             for ev in _unrenderable_events(reply, non_tool_blocks, step):
                 yield ev
@@ -493,6 +571,7 @@ async def run_agent_loop(
                 logger.info("agent_loop_write_sent_back", tool=name, step=step)
                 _replay(messages, reply.envelope, note)
                 continue
+            state.paused = True
             for ev in _confirm_events(name, args, reply.spoke, step):
                 yield ev
             return
@@ -523,6 +602,8 @@ async def run_agent_loop(
                 result_max_chars=tool_result_max_chars,
                 evidence=evidence,
                 loaded=loaded,
+                called=called,
+                skills=skills,
             )
         ) as running:
             async for ev in running:
@@ -540,36 +621,80 @@ async def run_agent_loop(
 
 
 _MAX_CORRECTIONS = 4
-_FIELD_CHECKED = frozenset({"create_document", "update_document"})
+_FIELD_CHECKED = frozenset({"create_document", BATCH_TOOL, "update_document"})
 
 
 async def _write_problem(
     name: str, args: dict[str, Any], registry: ToolRegistry, evidence: list[str]
 ) -> str | None:
-    """What is wrong with a write before the user is asked: unknown fields, or an unread address."""
+    """What is wrong with a write before the user is asked: its shape, unknown fields, or an
+    address it never read; for a batch, row by row."""
     doctype = args.get("doctype")
     if name not in _FIELD_CHECKED or not isinstance(doctype, str) or not doctype:
         return None
-    if not isinstance(args.get("data"), dict):
-        return (
+    rows, shape = _rows_of(name, args)
+    if shape is not None:
+        return shape
+    meta = ""
+    if "get_document" in registry.names():
+        meta = await registry.ainvoke("get_document", {"doctype": "DocType", "name": doctype})
+        # a definition that could not be read checks nothing; the write will say what it says
+        if meta.startswith(("Tool call failed", "Access denied", "error:")):
+            meta = ""
+    problems: list[str] = []
+    for label, row in rows:
+        for problem in _row_problems(row, meta, doctype, evidence):
+            if (labelled := label + problem) not in problems:
+                problems.append(labelled)
+        if len(problems) >= _MAX_ROW_PROBLEMS:
+            problems.append("Other rows may have the same problems; check them all.")
+            break
+    return " ".join(problems) or None
+
+
+_BATCH_MAX = 100
+_MAX_ROW_PROBLEMS = 6
+
+
+def _rows_of(
+    name: str, args: dict[str, Any]
+) -> tuple[list[tuple[str, dict[str, Any]]], str | None]:
+    """The write's rows with a label for each, or the reason its shape is wrong."""
+    if name == BATCH_TOOL:
+        rows = args.get("rows")
+        if (
+            not isinstance(rows, list)
+            or not rows
+            or not all(isinstance(r, dict) and r for r in rows)
+        ):
+            return [], (
+                'create_documents needs "rows": a non-empty list of field objects, for example '
+                '{"doctype": "Task", "rows": [{"subject": "..."}, {"subject": "..."}]}.'
+            )
+        if len(rows) > _BATCH_MAX:
+            return [], f"create_documents takes at most {_BATCH_MAX} rows a call: split the batch."
+        return [(f"Row {i}: ", r) for i, r in enumerate(rows, start=1)], None
+    data = args.get("data")
+    if not isinstance(data, dict):
+        return [], (
             f"{name} needs a data object holding the fields, for example "
             '{"doctype": "Lead", "data": {"company_name": "..."}}'
             + (', plus "name" for update_document.' if name == "update_document" else ".")
         )
+    return [("", data)], None
+
+
+def _row_problems(row: dict[str, Any], meta: str, doctype: str, evidence: list[str]) -> list[str]:
     problems: list[str] = []
-    if "get_document" in registry.names():
-        meta = await registry.ainvoke("get_document", {"doctype": "DocType", "name": doctype})
-        # a definition that could not be read checks nothing; the write will say what it says
-        if not meta.startswith(("Tool call failed", "Access denied", "error:")):
-            if bad_fields := check_write_data(meta, doctype, args.get("data")):
-                problems.append(bad_fields)
-    for field, value in unsupported_values(args.get("data"), "\n".join(evidence)):
+    if meta and (bad_fields := check_write_data(meta, doctype, row)):
+        problems.append(bad_fields)
+    for field_name, value in unsupported_values(row, "\n".join(evidence)):
         problems.append(
-            f"{field} is {value!r}, which appears in nothing you have read: an address or an "
+            f"{field_name} is {value!r}, which appears in nothing you have read: an address or an "
             "email cannot be worked out, only read. Fetch the page that shows it (a listing "
             "usually links each entry to a page of its own), or leave the field out."
         )
-    return " ".join(problems) or None
+    return problems
 
 
 def _text_of(blocks: list[dict[str, Any]]) -> str:
@@ -579,6 +704,27 @@ def _text_of(blocks: list[dict[str, Any]]) -> str:
         for b in blocks
         if b.get("type") == "text"
     )
+
+
+def _calls_typed_as_tools(envelope: dict[str, Any], tool_names: set[str]) -> dict[str, Any]:
+    """The envelope with a block typed as a tool name turned into the tool_call it meant.
+
+    Hosted providers do not enforce the schema's oneOf strictly, so a model sometimes writes
+    {"type": "list_documents", "payload": {...}}. Dropping it ends the turn with "couldn't be
+    rendered"; reading it as the call it plainly is lets the turn go on.
+    """
+    blocks = envelope.get("blocks")
+    if not isinstance(blocks, list) or not tool_names:
+        return envelope
+    fixed = []
+    for block in blocks:
+        kind = block.get("type") if isinstance(block, dict) else None
+        if isinstance(kind, str) and kind in tool_names:
+            payload = block.get("payload")
+            arguments = payload.get("arguments", payload) if isinstance(payload, dict) else {}
+            block = {"type": TOOL_CALL_TYPE, "payload": {"name": kind, "arguments": arguments}}
+        fixed.append(block)
+    return {**envelope, "blocks": fixed}
 
 
 def _is_tool_call(block: Any) -> bool:

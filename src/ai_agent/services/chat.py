@@ -29,10 +29,13 @@ from ai_agent.agent.loop import TurnFailure, cap_for_prompt, run_agent_loop
 from ai_agent.agent.prompts import build_system_prompt
 from ai_agent.agent.skills import build_skill_tool, build_skills_catalog, load_bundled_skills
 from ai_agent.agent.tool_registry import ToolRegistry
+from ai_agent.agent.transcript import ALLOWED_NOTE, deserialize, serialize, size
 from ai_agent.agent.web_tools import build_web_tools
 from ai_agent.config import Settings
 from ai_agent.integrations.frappe_history import FrappeHistoryClient
+from ai_agent.integrations.llm import create_llm
 from ai_agent.integrations.mcp import build_mcp_client_for_sid, filter_deprecated
+from ai_agent.integrations.models import ModelCatalog
 from ai_agent.middleware.sid import UserContext
 from ai_agent.middleware.site import set_current, set_current_bench_url
 
@@ -53,7 +56,8 @@ ANSWER_STOPPED = "The answer was stopped. Ask again for a full answer."
 # so there is no message of theirs to replay and nothing of the model's may stand in for one.
 CONFIRMED_TURN = (
     "The user allowed this action and it has run. Tell them the result in a line. If the task "
-    "you were doing has more changes left, make the next one now, as its own tool call; if "
+    "you were doing has more changes left, make them now: the remaining new records of one "
+    "doctype together in one create_documents call, any other change as its own tool call. If "
     "not, finish with a short summary of everything that was done."
 )
 
@@ -308,6 +312,39 @@ def _log_when_cancelled(
         raise
 
 
+def history_from_rows(
+    rows: list[dict[str, str]], *, budget: int, text_limit: int
+) -> list[BaseMessage]:
+    """The conversation as the model's memory: recent turns as they happened, older ones as text.
+
+    Walks back from the newest reply, replaying each turn's stored transcript (its calls, the
+    results it read, its reply) while the budget lasts; the first turn that does not fit, and
+    every turn before it, is replayed as its reply text, so the memory is always the latest
+    stretch of the conversation in full and the rest in outline.
+    """
+    replayed: dict[int, list[BaseMessage]] = {}
+    for i in range(len(rows) - 1, -1, -1):
+        row = rows[i]
+        if row["role"] != "assistant" or not row.get("transcript"):
+            continue
+        turn = deserialize(row["transcript"])
+        if not turn:
+            continue
+        if size(turn) > budget:
+            break
+        budget -= size(turn)
+        replayed[i] = turn
+    memory: list[BaseMessage] = []
+    for i, row in enumerate(rows):
+        if i in replayed:
+            memory.extend(replayed[i])
+        elif row["role"] == "user":
+            memory.append(HumanMessage(content=cap_for_prompt(row["content"], text_limit)))
+        elif row["content"]:
+            memory.append(AIMessage(content=cap_for_prompt(row["content"], text_limit)))
+    return memory
+
+
 class ChatService:
     """Shared by every request and holds no per-user state: each turn builds its own MCP client."""
 
@@ -318,9 +355,13 @@ class ChatService:
         llm: BaseChatModel,
         system_prompt_builder: SystemPromptBuilder = build_system_prompt,
         history: FrappeHistoryClient | None = None,
+        models: ModelCatalog | None = None,
     ) -> None:
         self._settings = settings
         self._llm = llm
+        self._models = models or ModelCatalog(settings)
+        # one client per model a user picked, made on first use; the default is the one passed in
+        self._llms: dict[str, BaseChatModel] = {settings.llm_model: llm}
         self._build_system_prompt = system_prompt_builder
         self._history = history or FrappeHistoryClient(base_url=settings.frappe_url)
         # Built once: the web tools carry no per-user state, unlike the MCP client.
@@ -329,6 +370,16 @@ class ChatService:
         self._skills = load_bundled_skills()
         self._skill_tool = build_skill_tool(self._skills)
         self._skills_catalog = build_skills_catalog(self._skills)
+
+    async def _llm_for(self, model: Any) -> BaseChatModel:
+        """The model this turn asked for when the provider offers it; the default otherwise."""
+        if not isinstance(model, str) or model == self._settings.llm_model:
+            return self._llm
+        if not await self._models.offers(model):
+            return self._llm
+        if model not in self._llms:
+            self._llms[model] = create_llm(self._settings.model_copy(update={"llm_model": model}))
+        return self._llms[model]
 
     async def aclose(self) -> None:
         """Release any owned async resources (HTTP connection pools, etc.)."""
@@ -392,13 +443,11 @@ class ChatService:
         rows = await self._history.list_messages(
             sid=sid, session=session_id, limit=20, site=site, base_url=base_url
         )
-        limit = self._settings.agent_prompt_text_max_chars
-        return [
-            HumanMessage(content=cap_for_prompt(row["content"], limit))
-            if row["role"] == "user"
-            else AIMessage(content=cap_for_prompt(row["content"], limit))
-            for row in rows
-        ]
+        return history_from_rows(
+            rows,
+            budget=self._settings.agent_history_chars,
+            text_limit=self._settings.agent_prompt_text_max_chars,
+        )
 
     async def _load_tools(
         self,
@@ -505,6 +554,8 @@ class ChatService:
         # Rebound below to the registry's own rows, which carry each call's outcome; empty
         # until then, so a turn that never gets a registry still saves and still ends.
         tool_invocations: list[dict[str, Any]] = []
+        # The turn as the model saw it, filled by the agent loop however the turn ends.
+        transcript: list[BaseMessage] = []
         decode = _DecodeUsage()
         # One clock for the turn: perf_counter, not time(), so a system-clock jump cannot move it.
         t0 = time.perf_counter()
@@ -551,6 +602,12 @@ class ChatService:
                     content=content,
                     tool_args_json=tool_args_json,
                     tool_result_json=tool_result_json,
+                    # a confirmed turn's question is the agent's own; say what it was instead
+                    transcript_json=serialize(
+                        [HumanMessage(content=ALLOWED_NOTE), *transcript]
+                        if confirmation
+                        else transcript
+                    ),
                     site=user_context.site,
                     base_url=user_context.frappe_base_url,
                 )
@@ -635,7 +692,7 @@ class ChatService:
                         async for ev in _until(
                             deadline,
                             run_agent_loop(
-                                llm=self._llm,
+                                llm=await self._llm_for((context or {}).get("model")),
                                 tool_registry=tool_registry,
                                 user_message=user_message,
                                 context_preamble=context_preamble,
@@ -646,6 +703,7 @@ class ChatService:
                                 session=session_id,
                                 confirmed=_confirmed_call(confirmation),
                                 skills=self._skills,
+                                record=transcript,
                             ),
                         ):
                             for out in events.observe(ev, t0=t0, session_id=session_id):
