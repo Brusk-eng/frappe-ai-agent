@@ -61,6 +61,22 @@ def test_load_bundled_skills_loads_all_nine() -> None:
         assert len(skill.content) > 0
 
 
+def test_lead_create_writes_notes_linked_to_the_lead() -> None:
+    skill = load_bundled_skills()["lead-create"]
+    # ERPNext keeps a lead's notes in its CRM Note table; Frappe CRM in FCRM Note records
+    assert skill.records["Lead"][-1] == "notes"
+    assert skill.records["CRM Note"] == ["note"]
+    assert skill.records["FCRM Note"] == [
+        "title",
+        "content",
+        "reference_doctype",
+        "reference_docname",
+    ]
+    assert '"notes": [{"note":' in skill.content
+    assert '"reference_doctype": "CRM Lead"' in skill.content
+    assert "reference_docname" in skill.content
+
+
 def test_build_skills_catalog() -> None:
     skills = {
         "print-format": Skill(
