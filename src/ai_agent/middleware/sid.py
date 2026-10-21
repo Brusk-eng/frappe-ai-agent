@@ -23,6 +23,8 @@ class UserContext:
     bench_url: str | None = None
     # where this user's Frappe actually is, as resolved from operator config
     frappe_base_url: str = ""
+    # the signed-in user Frappe named for this sid (set by require_sid)
+    user: str | None = None
 
     def __post_init__(self) -> None:
         if not self.sid or not self.sid.strip():
@@ -92,4 +94,5 @@ async def require_sid(request: Request) -> UserContext:
         site=user_context.site,
         bench_url=user_context.bench_url,
         frappe_base_url=frappe_url,
+        user=user,
     )

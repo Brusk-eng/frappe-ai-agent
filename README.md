@@ -183,6 +183,9 @@ there is silent — check the resolved values on `GET /config`.
 | `AI_AGENT_AGENT_RATE_LIMIT` | `30/minute` | slowapi-format per-sid rate limit on `POST /api/v1/chat` (e.g. `100/hour`, `10/second`) |
 | `AI_AGENT_RATE_LIMIT_STORAGE_URI` | `memory://` | Where the rate limit is counted. The default counts in the worker's own memory, so N workers let one sid make N times the limit; point it at the Redis the stack already runs (`redis://redis:6379/1`) and they share one count. A URI slowapi cannot open is refused at startup rather than silently not limiting. |
 | `AI_AGENT_MCP_SERVER_URL` | `http://localhost:8080/mcp` | MCP Streamable HTTP endpoint |
+| `AI_AGENT_USAGE_CHECK_URL` | *(empty)* | Optional usage gate: before answering a typed message, POST `{"site", "user"}` here and refuse the turn with the returned `reason` when it answers `allowed: false`. Empty = no check |
+| `AI_AGENT_USAGE_CHECK_TOKEN` | *(empty)* | Sent as the `X-Usage-Token` header to the usage check |
+| `AI_AGENT_USAGE_CHECK_TIMEOUT_S` | `5.0` | How long to wait for the usage check; unreachable or 5xx lets the message through, 4xx refuses it |
 | `AI_AGENT_MCP_TOOLS_LOAD_TIMEOUT_S` | `20.0` | Per-request bound on `tools/list`. A timeout becomes a single SSE `error` event, not a hung stream |
 | `AI_AGENT_MCP_TOOL_TIMEOUT_S` | `30.0` | Bound on one tool call, and on the HTTP and SSE read timeouts of the MCP session under it. A timeout comes back as a tool result the model can answer around |
 | `AI_AGENT_WEB_SEARCH_PROVIDER` | `off` | The backend of the agent's built-in `web_search` tool: `searxng` (self-hosted, needs `AI_AGENT_WEB_SEARCH_URL`), `brave` or `tavily` (need `AI_AGENT_WEB_SEARCH_API_KEY`), `duckduckgo` (no key, laptop use only), or `off` to register no web tools. See "Web search" |

@@ -92,6 +92,14 @@ class Settings(BaseSettings):
     # agent_rate_limit x workers x replicas; point every process at one redis:// to share it.
     rate_limit_storage_uri: str = "memory://"
 
+    # Optional usage gate: before answering a typed message, POST
+    # {"site", "user"} to this URL with header `X-Usage-Token: <usage_check_token>`
+    # and refuse the turn with the service's reason when it answers allowed=false.
+    # Empty (the default) = no check at all.
+    usage_check_url: str = ""
+    usage_check_token: str = ""
+    usage_check_timeout_s: float = 5.0
+
     # MCP: Streamable HTTP endpoint. frappe-mcp-server mounts /mcp on its
     # main HTTP port (default 8080), NOT the port+1 MCP-protocol-only server.
     mcp_server_url: str = "http://localhost:8080/mcp"

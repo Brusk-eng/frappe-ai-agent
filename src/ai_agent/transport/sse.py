@@ -11,6 +11,8 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 from slowapi import Limiter
 
+from ai_agent.integrations import usage
+
 # tests override the agent's auth by this name; keep it importable from here
 from ai_agent.middleware.sid import UserContext
 from ai_agent.middleware.sid import require_sid as _require_sid
@@ -98,6 +100,21 @@ def create_sse_router(
         # decorator: it inspects the wrapped function's signature for a
         # parameter named exactly `request`.
         chat_service = request.app.state.chat_service
+
+        # Only a typed message counts toward usage; allowing a proposed write does not.
+        settings = getattr(request.app.state, "settings", None)
+        if settings is not None and body.message is not None:
+            reason = await usage.refusal_reason(settings, user_context.site, user_context.user)
+            if reason:
+
+                async def refused():
+                    yield serialize({"type": "error", "message": reason})
+
+                return StreamingResponse(
+                    refused(),
+                    media_type="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+                )
 
         async def event_stream():
             async for event in chat_service.handle_message(
